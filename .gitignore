@@ -1,0 +1,18 @@
+# Entorno virtual
+venv/
+
+# Archivos compilados de Python
+__pycache__/
+*.py[cod]
+
+# Archivos de configuración y caché del editor
+.vscode/
+*.code-workspace
+
+# Archivos de log y datos
+*.log
+*.csv
+*.tmp
+
+# Archivos del sistema operativo
+.DS_Store
