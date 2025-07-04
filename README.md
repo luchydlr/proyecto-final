@@ -13,11 +13,12 @@ Este proyecto implementa un sistema de análisis facial utilizando MediaPipe Fac
 1. Clona el repositorio:
 
     git clone https://github.com/luchydlr/proyecto-final.git
+   
     cd proyecto-final
    
-2. Crea y activa el entorno virtual:
+3. Crea y activa el entorno virtual:
 
-    python -m venv venv
+    python3.11 -m venv venv
    
     _En Windows PowerShell_
 
