@@ -60,25 +60,30 @@ def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filena
     state_text = ''
     yawn_count = 0
     yawn_timer = 0
-    mouth_open_frame_count = 0  # Nueva variable
+    mouth_open_frame_count = 0
+
+    blink_count = 0
+    eyes_closed_prev = False  # Para detectar transición abierto → cerrado
 
     with open(csv_filename, mode='w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(['Timestamp', 'PERCLOS (%)', 'State', 'Yawn'])
+        writer.writerow(['Timestamp', 'PERCLOS (%)', 'State', 'Yawns', 'Blinks'])
 
         plt.ion()
         fig, ax = plt.subplots(figsize=(10, 5))
         max_points = 30
         perclos_vals = deque([0] * max_points, maxlen=max_points)
         yawn_vals = deque([0] * max_points, maxlen=max_points)
+        blink_vals = deque([0] * max_points, maxlen=max_points)
         timestamps = deque([''] * max_points, maxlen=max_points)
 
         line_perclos, = ax.plot(list(perclos_vals), label="PERCLOS (%)", color='blue')
         line_yawn, = ax.plot(list(yawn_vals), label="YAWNS acumulados", color='red')
+        line_blinks, = ax.plot(list(blink_vals), label="BLINKS acumulados", color='green')
 
         ax.set_ylim(0, 100)
         ax.set_title("Monitoreo de Fatiga en Tiempo Real")
-        ax.set_ylabel("PERCLOS / YAWNS")
+        ax.set_ylabel("PERCLOS / YAWNS / BLINKS")
         ax.set_xlabel("Tiempo")
         ax.legend()
         fig.tight_layout()
@@ -102,7 +107,14 @@ def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filena
                 if are_eyes_closed(marks):
                     closed_frames += 1
 
-                # Labios
+                # --- Lógica de parpadeos ---
+                if not eyes_closed_prev and are_eyes_closed(marks):
+                    eyes_closed_prev = True
+                elif eyes_closed_prev and not are_eyes_closed(marks):
+                    blink_count += 1
+                    eyes_closed_prev = False
+
+                # --- Boca / Bostezo ---
                 x_top = int(marks[0][0].x * frame.shape[1])
                 y_top = int(marks[0][0].y * frame.shape[0])
                 x_bot = int(marks[0][17].x * frame.shape[1])
@@ -110,16 +122,14 @@ def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filena
                 mouth_opening = marks[0][17].y - marks[0][0].y
                 is_yawning = mouth_opening > 0.10
 
-                # Dibujo
                 cv2.circle(frame, (x_top, y_top), 4, (0, 255, 0), -1)
                 cv2.circle(frame, (x_bot, y_bot), 4, (0, 255, 0), -1)
                 line_color = (0, 0, 255) if is_yawning else (0, 255, 0)
                 cv2.line(frame, (x_top, y_top), (x_bot, y_bot), line_color, 2)
 
-                # Nueva lógica para detectar bostezo sostenido
                 if is_yawning:
                     mouth_open_frame_count += 1
-                    if mouth_open_frame_count == 10:  # al menos 10 frames seguidos
+                    if mouth_open_frame_count == 10:
                         yawn_count += 1
                         yawn_timer = 30
                 else:
@@ -135,18 +145,20 @@ def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filena
                     state_text = "SLEEPY" if perclos > perclos_threshold else "AWAKE"
 
                 timestamp = datetime.now().strftime("%H:%M:%S")
-                writer.writerow([timestamp, round(perclos, 2), state_text, yawn_count])
-                print(f"[{timestamp}] PERCLOS: {perclos:.2f}% → {state_text} | Yawns: {yawn_count}")
+                writer.writerow([timestamp, round(perclos, 2), state_text, yawn_count, blink_count])
+                print(f"[{timestamp}] PERCLOS: {perclos:.2f}% → {state_text} | Yawns: {yawn_count} | Blinks: {blink_count}")
 
-                # Actualizar gráfica
                 perclos_vals.append(perclos)
                 yawn_vals.append(yawn_count)
+                blink_vals.append(blink_count)
                 timestamps.append(timestamp)
 
                 line_perclos.set_ydata(list(perclos_vals))
                 line_perclos.set_xdata(range(len(perclos_vals)))
                 line_yawn.set_ydata(list(yawn_vals))
                 line_yawn.set_xdata(range(len(yawn_vals)))
+                line_blinks.set_ydata(list(blink_vals))
+                line_blinks.set_xdata(range(len(blink_vals)))
 
                 ax.set_xticks(range(len(timestamps)))
                 ax.set_xticklabels(list(timestamps), rotation=45, fontsize=8)
@@ -160,6 +172,7 @@ def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filena
 
             display_state_text(frame, state_text, position=(30, 30))
             display_state_text(frame, f"YAWNS: {yawn_count}", position=(30, 70))
+            display_state_text(frame, f"BLINKS: {blink_count}", position=(30, 110))
             frames_cnt += 1
 
             cv2.imshow("FaceMesh + PERCLOS", frame)
