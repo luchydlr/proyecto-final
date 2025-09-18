@@ -1,0 +1,86 @@
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y git python3 python3-pip python3-venv build-essential cmake pkg-config
+sudo apt install -y libjpeg-dev libpng-dev libtiff-dev libavcodec-dev libavformat-dev libswscale-dev \
+libv4l-dev libxvidcore-dev libx264-dev libgtk-3-dev libatlas-base-dev gfortran
+sudo apt install -y libcamera-apps rpicam-apps v4l-utils python3-opencv python3-picamera2
+
+#PYTHON
+pip3 install --upgrade pip
+pip3 install opencv-python mediapipe numpy matplotlib
+
+#facemesh
+wget https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task -O face_landmarker.task
+
+sudo apt install -y rpicam-apps
+rpicam-hello --list-cameras
+rpicam-hello
+
+
+
+
+
+from picamera2 import Picamera2
+import cv2
+import mediapipe as mp
+
+# Inicializar detector de rostros de MediaPipe
+print("Inicializando detector...")
+BaseOptions = mp.tasks.BaseOptions
+FaceLandmarker = mp.tasks.vision.FaceLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = FaceLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path="face_landmarker.task"),
+    running_mode=VisionRunningMode.IMAGE,
+    num_faces=1
+)
+
+detector = FaceLandmarker.create_from_options(options)
+
+# Inicializar cámara
+print("Inicializando cámara...")
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+picam2.configure(preview_config)
+picam2.start()
+
+print("🟢 Cámara funcionando. Presiona 'q' para salir.")
+
+# Crear UNA sola ventana persistente
+cv2.namedWindow("Vision Nocturna IR + Detección Facial", cv2.WINDOW_NORMAL)
+
+while True:
+    # Capturar frame
+    frame = picam2.capture_array()
+
+    # Convertir a escala de grises para simular visión nocturna (IR)
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    infrared_frame = cv2.applyColorMap(gray, cv2.COLORMAP_BONE)
+
+    # Detección de rostros con MediaPipe
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+    result = detector.detect(mp_image)
+
+    display_frame = infrared_frame.copy()
+
+    # Dibujar rostros detectados
+    if result and result.face_landmarks:
+        for face_landmarks in result.face_landmarks:
+            for lm in face_landmarks:
+                h, w, _ = display_frame.shape
+                x, y = int(lm.x * w), int(lm.y * h)
+                cv2.circle(display_frame, (x, y), 1, (0, 255, 0), -1)
+
+    # Mostrar frame en la ventana creada
+    cv2.imshow("Vision Nocturna IR + Detección Facial", display_frame)
+
+    # Salir con tecla 'q'
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+# Liberar recursos
+picam2.stop()
+cv2.destroyAllWindows()
+
+

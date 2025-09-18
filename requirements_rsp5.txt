@@ -1,0 +1,89 @@
+sudo apt update && sudo apt upgrade -y
+
+sudo apt install -y git python3 python3-pip python3-venv build-essential cmake pkg-config
+
+sudo apt install -y libjpeg-dev libpng-dev libtiff-dev libavcodec-dev libavformat-dev libswscale-dev \
+libv4l-dev libxvidcore-dev libx264-dev libgtk-3-dev libatlas-base-dev gfortran
+
+sudo apt install -y libcamera-apps rpicam-apps v4l-utils python3-picamera2
+
+python3 -m pip install --upgrade pip
+
+pip3 install opencv-python mediapipe numpy matplotlib
+
+wget -O face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+
+rpicam-hello -t 5000
+
+python3 - <<'EOF'
+from picamera2 import Picamera2
+import cv2
+
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+picam2.configure(preview_config)
+picam2.start()
+
+print("🟢 Cámara funcionando. Presiona 'q' para salir.")
+
+while True:
+    frame = picam2.capture_array()
+    cv2.imshow("Preview", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+picam2.stop()
+cv2.destroyAllWindows()
+EOF
+
+
+python3 - <<'EOF'
+from picamera2 import Picamera2
+import cv2
+import mediapipe as mp
+
+# Inicializar detector de rostros
+BaseOptions = mp.tasks.BaseOptions
+FaceLandmarker = mp.tasks.vision.FaceLandmarker
+FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = FaceLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path="face_landmarker.task"),
+    running_mode=VisionRunningMode.IMAGE,
+    num_faces=1
+)
+
+detector = FaceLandmarker.create_from_options(options)
+
+# Inicializar cámara
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(main={"format": "RGB888", "size": (640, 480)})
+picam2.configure(preview_config)
+picam2.start()
+
+cv2.namedWindow("Detección Facial", cv2.WINDOW_NORMAL)
+print("🟢 Cámara funcionando con detección facial. Presiona 'q' para salir.")
+
+while True:
+    frame = picam2.capture_array()
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+    result = detector.detect(mp_image)
+
+    display_frame = frame.copy()
+    if result and result.face_landmarks:
+        for face_landmarks in result.face_landmarks:
+            for lm in face_landmarks:
+                h, w, _ = display_frame.shape
+                x, y = int(lm.x * w), int(lm.y * h)
+                cv2.circle(display_frame, (x, y), 1, (0, 255, 0), -1)
+
+    cv2.imshow("Detección Facial", display_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+picam2.stop()
+cv2.destroyAllWindows()
+EOF
+
