@@ -35,16 +35,16 @@ CSV_FILENAME = "perclos_log.csv"
 
 # MQTT (mismo hilo de inferencia)
 MQTT_ENABLE = True
-MQTT_BROKER = "tu-endpoint-aws.iot.amazonaws.com"  # Cambia por tu broker
+MQTT_BROKER = "a1omfl67425kjv-ats.iot.us-east-2.amazonaws.com"  # Cambia por tu broker
 MQTT_PORT = 1883                                   # 1883 sin TLS, 8883 con TLS
 MQTT_TOPIC_METRICS = "fatiga/metricas"
-MQTT_TOPIC_ALERTS  = "fatiga/alertas"
+MQTT_TOPIC_ALERTS  = "fatiga/alerts"
 
 # TLS (opcional para AWS IoT Core)
 MQTT_USE_TLS = False           # Pon True para TLS (puerto 8883)
-CA_CERTS = "/path/AmazonRootCA1.pem"
-CLIENT_CERT = "/path/certificate.pem.crt"
-CLIENT_KEY  = "/path/private.pem.key"
+CA_CERTS = "/home/lucianadelarosa/Desktop/proyecto-final/AmazonRootCA1.pem"
+CLIENT_CERT = "/home/lucianadelarosa/Desktop/proyecto-final/certificate.pem.crt"
+CLIENT_KEY  = "/home/lucianadelarosa/Desktop/proyecto-final/private.pem.key"
 
 # Anti-spam de alertas
 ALERT_COOLDOWN_S = 5.0

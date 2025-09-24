@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # ================== CONFIG ==================
 load_dotenv()
-DEVICE_ID            = os.getenv("DEVICE_ID", "rsp-unknown")
+DEVICE_ID            = os.getenv("DEVICE_ID", "rsp5")
 
 # Cámara
 CAM_SIZE             = (640, 480)
@@ -105,7 +105,7 @@ class CaptureWorker(threading.Thread):
 
 # ================== DB Worker (MySQL) ==================
 class DBWorker(threading.Thread):
-    """ Inserta filas en estados_fatiga """
+    """ Inserta filas en alerts """
     def __init__(self, stop_evt, batch_size=20, flush_sec=2.0):
         super().__init__(daemon=True)
         self.stop_evt=stop_evt; self.batch_size=batch_size; self.flush_sec=flush_sec
@@ -122,7 +122,7 @@ class DBWorker(threading.Thread):
         try:
             self._connect()
             rows=[(x["device_id"],x["estado"],x["perclos"],x["blinks"],x["yawns"],x["ts"]) for x in self.buf]
-            sql="""INSERT INTO estados_fatiga (device_id, estado, perclos, blinks, yawns, ts)
+            sql="""INSERT INTO alerts (device_id, estado, perclos, blinks, yawns, ts)
                    VALUES (%s,%s,%s,%s,%s,%s)"""
             with self.conn.cursor() as cur: cur.executemany(sql, rows)
             self.buf.clear(); self.last_flush=time.time()
