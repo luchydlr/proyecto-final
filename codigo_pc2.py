@@ -10,12 +10,12 @@ from collections import deque
 
 def initialize_detector():
     print("Inicializando detector...")
-    base_options = mp_python.BaseOptions(model_asset_path='face_landmarker_v2_with_blendshapes.task')
+    base_options = mp_python.BaseOptions(model_asset_path='/Users/lucianadelarosa/Desktop/Facemesh_PF/facemesh/face_landmarker.task')
     options = mp_python.vision.FaceLandmarkerOptions(
         base_options=base_options,
         output_face_blendshapes=True,
         output_facial_transformation_matrixes=True,
-        num_faces=1
+        num_faces=2
     )
     return mp_python.vision.FaceLandmarker.create_from_options(options)
 
@@ -49,7 +49,7 @@ def draw_landmarks_on_frame(frame, marks):
         y = int(landmark.y * frame.shape[0])
         cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
 
-def process_video(detector, frames_interval=30, perclos_threshold=60, csv_filename='perclos_log.csv'):
+def process_video(detector, frames_interval=50, perclos_threshold=60, csv_filename='perclos_log.csv'):
     print("Abriendo cámara...")
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():

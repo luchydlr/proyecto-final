@@ -33,18 +33,15 @@ YAWN_HOLD_FRAMES = 5           # mar sostenido para contar bostezo
 # CSV
 CSV_FILENAME = "perclos_log.csv"
 
-# MQTT (mismo hilo de inferencia)
-MQTT_ENABLE = True
-MQTT_BROKER = "a1omfl67425kjv-ats.iot.us-east-2.amazonaws.com"  # Cambia por tu broker
-MQTT_PORT = 1883                                   # 1883 sin TLS, 8883 con TLS
-MQTT_TOPIC_METRICS = "fatiga/metricas"
-MQTT_TOPIC_ALERTS  = "fatiga/alerts"
-
-# TLS (opcional para AWS IoT Core)
-MQTT_USE_TLS = False           # Pon True para TLS (puerto 8883)
-CA_CERTS = "/home/lucianadelarosa/Desktop/proyecto-final/AmazonRootCA1.pem"
-CLIENT_CERT = "/home/lucianadelarosa/Desktop/proyecto-final/certificate.pem.crt"
-CLIENT_KEY  = "/home/lucianadelarosa/Desktop/proyecto-final/private.pem.key"
+# Config AWS y MQTT
+ENDPOINT = "a1omfl67425kjv-ats.iot.us-east-2.amazonaws.com"
+CLIENT_ID = "rsp5"
+TOPIC = "alertas"
+PORT = 8883
+MQTT_USE_TLS = True           # Pon True para TLS (puerto 8883)
+CA_CERTS = "aws/AmazonRootCA1.pem"
+CLIENT_CERT = "aws/certificate.pem.crt"
+CLIENT_KEY  = "aws/private.pem.key"
 
 # Anti-spam de alertas
 ALERT_COOLDOWN_S = 5.0
@@ -57,7 +54,7 @@ stop_event = threading.Event()
 # ================== MEDIA PIPE (CREACIÓN DE DETECTOR) ==================
 def initialize_detector():
     base_options = mp_python.BaseOptions(
-        model_asset_path="face_landmarker_v2_with_blendshapes.task"
+        model_asset_path="facemesh/face_landmarker.task"
     )
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -159,7 +156,7 @@ class InferenceWorker(threading.Thread):
         # MQTT
         self.mqtt_client = None
         self.last_alert_ts = {"sleepy": 0.0, "microsleep": 0.0, "yawn": 0.0}
-        if MQTT_ENABLE:
+        if MQTT_USE_TLS:
             self._init_mqtt()
 
     # ---------- MQTT helpers ----------
@@ -175,7 +172,7 @@ class InferenceWorker(threading.Thread):
                     tls_version=ssl.PROTOCOL_TLSv1_2
                 )
                 self.mqtt_client.tls_insecure_set(False)
-            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+            self.mqtt_client.connect(ENDPOINT, PORT, keepalive=60)
             # Nota: como estamos en un hilo dedicado, podemos usar loop() manual en cada publish
             print("🔗 MQTT conectado.")
         except Exception as e:
@@ -183,7 +180,7 @@ class InferenceWorker(threading.Thread):
             self.mqtt_client = None
 
     def _mqtt_publish(self, topic, payload_dict):
-        if not (MQTT_ENABLE and self.mqtt_client):
+        if not (MQTT_USE_TLS and self.mqtt_client):
             return
         try:
             self.mqtt_client.publish(topic, json.dumps(payload_dict), qos=0, retain=False)
@@ -200,7 +197,7 @@ class InferenceWorker(threading.Thread):
         now = time.time()
         last = self.last_alert_ts.get(kind, 0.0)
         if (now - last) >= ALERT_COOLDOWN_S:
-            self._mqtt_publish(MQTT_TOPIC_ALERTS, payload)
+            self._mqtt_publish(TOPIC, payload)
             self.last_alert_ts[kind] = now
 
     # ---------- Métricas ----------
@@ -254,17 +251,14 @@ class InferenceWorker(threading.Thread):
 
             # MQTT (métricas periódicas)
             metrics_payload = {
-                "ts": ts,
-                "perclos_pct": round(perclos, 2),
-                "state": state_at_window,
-                "yawns": int(self.yawn_count),
+                "device_id": CLIENT_ID,
+                "estado": state_at_window,
+                "perclos": round(perclos, 2),
                 "blinks": int(self.blink_count),
-                "ear_left": float(ear_l),
-                "ear_right": float(ear_r),
-                "mar": float(mar),
-                "window_frames": int(FRAMES_INTERVAL)
+                "yawns": int(self.yawn_count),
+                "ts": ts,
             }
-            self._mqtt_publish(MQTT_TOPIC_METRICS, metrics_payload)
+            self._mqtt_publish(TOPIC, metrics_payload)
 
             # Alerta sleepy por PERCLOS
             if sleepy:
@@ -334,7 +328,7 @@ class InferenceWorker(threading.Thread):
                 self.csv_file.close()
             except Exception:
                 pass
-            if MQTT_ENABLE and self.mqtt_client:
+            if MQTT_USE_TLS and self.mqtt_client:
                 try:
                     self.mqtt_client.disconnect()
                 except Exception:

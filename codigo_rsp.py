@@ -13,7 +13,7 @@ import math
 # =========================
 def initialize_detector():
     base_options = mp_python.BaseOptions(
-        model_asset_path="face_landmarker_v2_with_blendshapes.task"
+        model_asset_path="facemesh/face_landmarker.task"
     )
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
