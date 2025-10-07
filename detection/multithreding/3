@@ -1,0 +1,365 @@
+import os
+import cv2
+import math
+import csv
+import time
+import json
+import ssl
+import queue
+import threading
+import numpy as np
+from datetime import datetime
+from picamera2 import Picamera2
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+from paho.mqtt import client as mqtt
+
+# ================== CONFIGURACIÓN ==================
+CAM_SIZE = (640, 480)
+
+FRAMES_INTERVAL      = 30          # ventana para PERCLOS (frames)
+FATIGA_PERCLOS       = 40.0        # >=40% -> FATIGA (según tus umbrales)
+SOMNO_MIN_PERCLOS    = 60.0        # >=60% -> SOMNOLENCIA (prioridad mayor)
+MICROSLEEP_FRAMES    = 15          # racha de ojos cerrados consecutivos
+
+EYE_CLOSED_THRESHOLD = 0.009
+YAWN_MAR_THRESHOLD   = 0.7
+YAWN_HOLD_FRAMES     = 5
+
+CSV_FILENAME = "session_log.csv"
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+
+# ========== AWS IoT Core ==========
+ENDPOINT   = "a1omfl67425kjv-ats.iot.us-east-2.amazonaws.com"
+PORT       = 8883
+CLIENT_ID  = "rsp5"
+TOPIC      = "alertas"
+
+CA_PATH   = "aws/AmazonRootCA1.pem"
+CERT_PATH = "aws/certificate.pem.crt"
+KEY_PATH  = "aws/private.pem.key"
+
+MODEL_PATH = "facemesh/face_landmarker.task"
+
+frame_queue = queue.Queue(maxsize=1)
+annot_queue = queue.Queue(maxsize=1)
+stop_event  = threading.Event()
+
+# ================== AUXILIARES DE MÉTRICAS ==================
+def euclidean(a, b):
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+def eye_aspect_ratio(landmarks, right=True):
+    if right:
+        top, bottom = landmarks[145], landmarks[159]
+    else:
+        top, bottom = landmarks[374], landmarks[386]
+    return euclidean(top, bottom)
+
+def mouth_aspect_ratio(landmarks):
+    vertical_pairs = [(13, 14), (82, 87), (312, 317)]
+    horizontals = (78, 308)
+    v_dist = np.mean([euclidean(landmarks[a], landmarks[b]) for a, b in vertical_pairs])
+    h_dist = euclidean(landmarks[horizontals[0]], landmarks[horizontals[1]])
+    return (v_dist / h_dist) if h_dist > 0 else 0.0
+
+def put_text_rgb(rgb_frame, text, pos=(12, 28), color=(0, 255, 255)):
+    cv2.putText(rgb_frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+def draw_landmarks_on_frame_rgb(rgb_frame, marks):
+    h, w = rgb_frame.shape[:2]
+    for lm in marks[0]:
+        x = int(lm.x * w); y = int(lm.y * h)
+        cv2.circle(rgb_frame, (x, y), 1, (0, 255, 0), -1)
+
+# ================== MediaPipe: detector ==================
+def initialize_detector():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Modelo no encontrado: {MODEL_PATH}.")
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=True,
+        output_facial_transformation_matrixes=True,
+        num_faces=1
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+# ================== Hilo de Captura ==================
+class CaptureWorker(threading.Thread):
+    def __init__(self, stop_evt):
+        super().__init__(daemon=True)
+        self.stop_evt = stop_evt
+        self.picam2 = None
+
+    def run(self):
+        try:
+            self.picam2 = Picamera2()
+            cfg = self.picam2.create_preview_configuration(main={"format":"RGB888","size":CAM_SIZE})
+            self.picam2.configure(cfg)
+            self.picam2.start()
+            time.sleep(0.2)
+            print("🟢 Caamera ready (Picamera2).")
+        except Exception as e:
+            import traceback
+            print(f"❌ Error starting camera: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+            return
+
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    rgb = self.picam2.capture_array()
+                except Exception:
+                    time.sleep(0.005)
+                    continue
+
+                if frame_queue.full():
+                    try: frame_queue.get_nowait()
+                    except queue.Empty: pass
+                frame_queue.put(rgb)
+        except Exception as e:
+            import traceback
+            print(f"❌ Excepción en CaptureWorker: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+        finally:
+            try: self.picam2.stop()
+            except Exception: pass
+
+# ================== Hilo de Inferencia (CSV + MQTT) ==================
+class InferenceWorker(threading.Thread):
+    def __init__(self, stop_evt):
+        super().__init__(daemon=True)
+        self.stop_evt = stop_evt
+
+        # Detector
+        self.detector = initialize_detector()
+
+        # Estado/métricas (por ventana)
+        self.frames_cnt = 0            # frames procesados en la ventana
+        self.closed_frames = 0         # frames con ojos cerrados en la ventana
+        self.closed_streak = 0         # racha actual de ojos cerrados
+        self.microsleep_flag = False   # si ocurrió microsueño dentro de la ventana
+
+        # Contadores acumulados (puedes cambiarlos a "por ventana" si deseas)
+        self.yawn_frames = 0
+        self.yawn_count = 0
+        self.blink_count = 0
+        self.eyes_closed_prev = False
+
+        # CSV local
+        self.csv_file = open(CSV_FILENAME, mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['Timestamp', 'Estado', 'PERCLOS (%)', 'Yawns', 'Blinks'])
+
+        # MQTT
+        self.mqtt_client = mqtt.Client(client_id=CLIENT_ID)
+        self.mqtt_client.tls_set(
+            ca_certs=CA_PATH,
+            certfile=CERT_PATH,
+            keyfile=KEY_PATH,
+            tls_version=ssl.PROTOCOL_TLSv1_2
+        )
+        self.mqtt_client.on_connect = self._on_connect
+        try:
+            self.mqtt_client.connect(ENDPOINT, PORT, keepalive=60)
+            self.mqtt_client.loop_start()
+            print("🔗 MQTT (AWS IoT) started.")
+        except Exception as e:
+            import traceback
+            print(f"⚠️ No se pudo conectar a MQTT: {e}")
+            traceback.print_exc()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("✅ AWS IoT Core connected")
+        else:
+            print(f"❌ Error de conexión MQTT, código: {rc}")
+
+    def _publish(self, payload, qos=1):
+        if not self.mqtt_client:
+            return
+        try:
+            self.mqtt_client.publish(TOPIC, json.dumps(payload), qos=qos)
+        except Exception:
+            try:
+                self.mqtt_client.reconnect()
+            except Exception:
+                pass
+
+    # ---------- Procesamiento por frame ----------
+    def _process_metrics(self, marks):
+        lms = marks[0]
+        ear_r = eye_aspect_ratio(lms, right=True)
+        ear_l = eye_aspect_ratio(lms, right=False)
+        eyes_closed = (ear_r < EYE_CLOSED_THRESHOLD and ear_l < EYE_CLOSED_THRESHOLD)
+
+        if eyes_closed:
+            self.closed_frames += 1
+            self.closed_streak += 1
+        else:
+            self.closed_streak = 0
+
+        # Conteo de parpadeos (flanco de subida -> bajada)
+        if not self.eyes_closed_prev and eyes_closed:
+            self.eyes_closed_prev = True
+        elif self.eyes_closed_prev and not eyes_closed:
+            self.blink_count += 1
+            self.eyes_closed_prev = False
+
+        # Bostezo
+        mar = mouth_aspect_ratio(lms)
+        if mar > YAWN_MAR_THRESHOLD:
+            self.yawn_frames += 1
+        else:
+            if self.yawn_frames > YAWN_HOLD_FRAMES:
+                self.yawn_count += 1
+            self.yawn_frames = 0
+
+        return eyes_closed, mar
+
+    # Prioridad: MICROSUEÑO (si ocurrió en la ventana), luego SOMNOLENCIA (umbral más alto), luego FATIGA
+    def _estado_por_perclos(self, perclos):
+        if self.microsleep_flag:
+            return "MICROSUEÑO"
+        if perclos >= SOMNO_MIN_PERCLOS:
+            return "SOMNOLENCIA"
+        if perclos >= FATIGA_PERCLOS:
+            return "FATIGA"
+        return "NORMAL"
+
+    # Cierre de ventana: calcula PERCLOS estrictamente con FRAMES_INTERVAL y decide envío
+    def _ventana_cerrar(self):
+        # PERCLOS en [%]: frames cerrados / ventana fija
+        perclos = 100.0 * self.closed_frames / float(FRAMES_INTERVAL)
+        estado_final = self._estado_por_perclos(perclos)
+        ts = int(time.time())
+
+        # CSV: siempre
+        self.csv_writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            estado_final, round(perclos, 2),
+            self.yawn_count, self.blink_count
+        ])
+
+        # MQTT: solo si no es NORMAL
+        if estado_final != "NORMAL":
+            payload = {
+                "device_id": CLIENT_ID,
+                "estado": estado_final,
+                "perclos": round(perclos, 2),
+                "blinks": int(self.blink_count),
+                "yawns": int(self.yawn_count),
+                "ts": ts
+            }
+            self._publish(payload, qos=1)
+
+        # Reset de ventana
+        self.frames_cnt = 0
+        self.closed_frames = 0
+        self.closed_streak = 0
+        self.microsleep_flag = False
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+              f"PERCLOS={perclos:.2f}% | Estado={estado_final} | "
+              f"Yawns={self.yawn_count} | Blinks={self.blink_count}")
+
+    def run(self):
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    rgb = frame_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                state_overlay = "NORMAL"
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = self.detector.detect(mp_image)
+
+                if result.face_landmarks:
+                    draw_landmarks_on_frame_rgb(rgb, result.face_landmarks)
+                    eyes_closed, mar = self._process_metrics(result.face_landmarks)
+
+                    # Overlay informativo
+                    if eyes_closed:
+                        state_overlay = "OJOS CERRADOS"
+                    elif mar > YAWN_MAR_THRESHOLD:
+                        state_overlay = "BOSTEZO"
+                    else:
+                        state_overlay = "NORMAL"
+
+                    # Contar frame de la ventana (solo si hubo rostro)
+                    self.frames_cnt += 1
+
+                    # Marcar microsueño como estado de la ventana (sin publicar inmediato)
+                    if self.closed_streak >= MICROSLEEP_FRAMES:
+                        self.microsleep_flag = True
+                        state_overlay = "MICROSUEÑO"
+
+                    # Cierre de ventana estricta
+                    if self.frames_cnt >= FRAMES_INTERVAL:
+                        self._ventana_cerrar()
+                else:
+                    put_text_rgb(rgb, "Sin rostro", (12, 56), (0, 255, 255))
+
+                put_text_rgb(rgb, state_overlay, (12, 28))
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                if annot_queue.full():
+                    try: annot_queue.get_nowait()
+                    except queue.Empty: pass
+                annot_queue.put(bgr)
+
+                frame_queue.task_done()
+        except Exception as e:
+            import traceback
+            print(f"❌ Excepción en InferenceWorker: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+        finally:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            try:
+                if self.mqtt_client:
+                    self.mqtt_client.loop_stop()
+                    self.mqtt_client.disconnect()
+            except Exception:
+                pass
+
+# ================== MAIN / UI ==================
+def main():
+    print("Iniciando hilos (captura / inferencia)…")
+    cap_t = CaptureWorker(stop_event)
+    inf_t = InferenceWorker(stop_event)
+
+    cap_t.start()
+    inf_t.start()
+
+    print(f"🟢 Presiona 'q' para salir. HEADLESS={HEADLESS}")
+    try:
+        while not stop_event.is_set():
+            try:
+                frame = annot_queue.get(timeout=0.3)
+                if not HEADLESS:
+                    cv2.imshow("Fatigue Monitor - OV5647 (MT + MQTT)", frame)
+                    if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                        stop_event.set()
+            except queue.Empty:
+                pass
+    finally:
+        stop_event.set()
+        cap_t.join(timeout=2.0)
+        inf_t.join(timeout=2.0)
+        if not HEADLESS:
+            cv2.destroyAllWindows()
+        print("Finalizado.")
+
+if __name__ == "__main__":
+    main()
