@@ -1,95 +1,82 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fatigue Edge v2.1 — Reglas (PERCLOS/EAR/MAR) + ROI + Alerts + Telemetry + Health
-- SIN TensorFlow. MediaPipe Face Detection (opcional) + FaceMesh.
-- Estados EXACTOS por tu tabla. PERCLOS ventana 10 s. Tasas por minuto (60 s).
-- BLOQUEO de falsos 'somnolencia' por pocos blinks al inicio: se exige cobertura temporal.
+Fatigue Edge RPi — Simple & Robust (Picamera2-first) + Reglas exactas + MQTT
+- Cámara: intenta Picamera2 (libcamera). Si falla, cae a OpenCV V4L2.
+- MediaPipe FaceMesh sobre frame completo (sin ROI por defecto).
+- Métricas EXACTAS:
+    perclos: fracción [0..1] redondeada a 2
+    blinks : eventos/min (entero)
+    yawns  : eventos/min (entero)
+- Clasificación EXACTA por tabla, con salvaguardas:
+    * No usa "blinks bajos" para somnolencia hasta tener >=45 s de cobertura
+    * MICROSUEÑO por blinks<6 sólo si cobertura >=45 s; por PERCLOS>0.8 siempre
+- Publica 1 vez por segundo (anti-spam).
 
-MQTT topics:
-- fatiga/estado     -> estado principal (payload compacto)
-- fatiga/alerta     -> cambios de nivel de alerta (0..3) con histéresis
-- telemetry/health  -> métricas de salud (fps, temp, watchdog, no-face)
-
-© PF Luciana
+Payload MQTT EXACTO:
+{"device_id": "...", "estado": "...", "perclos": 0.xx, "blinks": int, "yawns": int, "ts": epoch}
 """
-import os, time, math, json, threading, queue, argparse
+
+import time, json, threading, queue, argparse
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Tuple
-import numpy as np, cv2
+import numpy as np
+import cv2
 
-# ===== MQTT opcional =====
+# ====== MQTT opcional ======
 try:
     from paho.mqtt import client as mqtt
 except Exception:
     mqtt = None
 
-# ===== MediaPipe =====
+# ====== Picamera2 opcional ======
+PICAM2_OK = True
+try:
+    from picamera2 import Picamera2
+except Exception:
+    PICAM2_OK = False
+
+# ====== MediaPipe FaceMesh ======
 MP_OK = True
 try:
     import mediapipe as mp
 except Exception:
     MP_OK = False
 
-# ---------------- Config ----------------
-# (AQUÍ AJUSTAS) cámara
-CAM_SIZE = (640, 480)
-TARGET_FPS = 30
+# ---------------- Config (AQUÍ AJUSTAS) ----------------
+CAM_SIZE = (640, 480)         # resolución de captura
+TARGET_FPS = 30               # objetivo de FPS
+FACEMESH_HZ = 20.0            # ~15–25 Hz va bien en RPi
+EAR_BLINK_TH = 0.09
+MAR_YAWN_TH  = 0.65
 
-# (AQUÍ AJUSTAS) frecuencias de procesamiento
-FACEMESH_HZ = 20.0                 # 15–25 Hz recomendado para FaceMesh
-DETECT_HZ   = 7.0                  # 5–10 Hz para ROI (Face Detection)
+PERCLOS_WINDOW_SEC  = 10.0    # ventana para PERCLOS
+EVENT_RATE_WINDOW_S = 60.0    # ventana para blinks/yawns por minuto
 
-# (AQUÍ AJUSTAS) umbrales de eventos (dados por ti)
-EAR_BLINK_TH = 0.09                # parpadeo si EAR < 0.09
-MAR_YAWN_TH  = 0.65                # bostezo si MAR > 0.65
+MIN_COVERAGE_BLINKS_S = 45.0  # exigir >=45 s para usar blinks en la decisión
+MIN_COVERAGE_YAWNS_S  = 30.0  # exigir >=30 s para usar yawns en reglas estrictas
 
-# (AQUÍ AJUSTAS) ventanas temporales
-PERCLOS_WINDOW_SEC   = 10.0        # 10 s para PERCLOS (más estabilidad)
-EVENT_RATE_WINDOW_S  = 60.0        # blinks / yawns por minuto (últimos 60 s)
-
-# (AQUÍ AJUSTAS) confianza mínima por cobertura
-MIN_COVERAGE_BLINKS_S = 45.0       # exigir >=45 s para usar blinks en la decisión
-MIN_COVERAGE_YAWNS_S  = 30.0       # (opcional) exigir >=30 s para usar yawns en reglas estrictas
-
-# (AQUÍ AJUSTAS) ROI
-ROI_MARGIN = 0.20                  # margen extra alrededor del face bbox
-
-# (AQUÍ AJUSTAS) alertas (escalamiento / histéresis)
-SOMNO_LVL1_S = 10.0
-SOMNO_LVL2_S = 20.0
-SOMNO_LVL3_S = 40.0
-FATIGA_LVL1_S = 10.0
-FATIGA_LVL2_S = 20.0
-RECOVERY_DOWN_S = 15.0             # tiempo en NORMAL para bajar de nivel
-
-# ---------------- Verbose flag (logs)
-VERBOSE = False
-
-def vprint(*args, **kwargs):
-    if VERBOSE:
-        print(*args, **kwargs)
+PUBLISH_HZ = 1.0              # publica 1 vez por segundo
 
 # ---------------- Data ----------------
 def now() -> float: return time.time()
 
 @dataclass
-class Frame:    ts:float; bgr:np.ndarray; fps:float
+class Frame: ts:float; bgr:np.ndarray; fps:float
+
 @dataclass
-class FaceROI:  ts:float; xyxy:Tuple[int,int,int,int]; conf:float
-@dataclass
-class Landmarks: ts:float; pts:np.ndarray  # (468,2) coords en FULL FRAME
+class Landmarks: ts:float; pts:np.ndarray  # (468,2)
+
 @dataclass
 class Features:
     ts:float; ear:float; mar:float; perclos:float
     blinks:int; yawns:int
-    blink_cov_s: float; yawn_cov_s: float   # cobertura (segundos observados)
+    blink_cov_s:float; yawn_cov_s:float
 
-# ---------------- Queues & helpers ----------------
+# ---------------- Queues ----------------
 stop = threading.Event()
 q_frame = queue.Queue(maxsize=4)
-q_roi   = queue.Queue(maxsize=2)
 q_lm    = queue.Queue(maxsize=2)
 q_feat  = queue.Queue(maxsize=4)
 
@@ -107,32 +94,7 @@ def get_latest(q:queue.Queue):
     except queue.Empty: pass
     return last
 
-# ---------------- MediaPipe wrappers ----------------
-class MPFaceDetector:
-    def __init__(self):
-        self.ok = MP_OK
-        if self.ok:
-            self.det = mp.solutions.face_detection.FaceDetection(
-                model_selection=0, min_detection_confidence=0.5)
-        else:
-            self.det = None
-            print("[MP] FaceDetection no disponible — ROI off")
-
-    def __call__(self, bgr: np.ndarray):
-        if not self.ok: return None
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        r = self.det.process(rgb)
-        if not r.detections: return None
-        d = r.detections[0]
-        bb = d.location_data.relative_bounding_box
-        h, w = bgr.shape[:2]
-        x, y, ww, hh = int(bb.xmin*w), int(bb.ymin*h), int(bb.width*w), int(bb.height*h)
-        # margen
-        mx, my = int(ROI_MARGIN*ww), int(ROI_MARGIN*hh)
-        x1, y1 = max(0, x-mx), max(0, y-my)
-        x2, y2 = min(w-1, x+ww+mx), min(h-1, y+hh+my)
-        return (x1, y1, x2, y2), float(d.score[0])
-
+# ---------------- MediaPipe FaceMesh wrapper ----------------
 class MPFaceMesh:
     def __init__(self):
         self.ok = MP_OK
@@ -141,7 +103,7 @@ class MPFaceMesh:
                 static_image_mode=False, max_num_faces=1, refine_landmarks=True,
                 min_detection_confidence=0.5, min_tracking_confidence=0.5)
         else:
-            self.mesh=None; print("[MP] FaceMesh no disponible")
+            self.mesh=None; print("[ERR] MediaPipe no disponible (instala 'mediapipe').")
     def __call__(self, bgr: np.ndarray) -> Optional[np.ndarray]:
         if not self.ok: return None
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -159,7 +121,7 @@ MOUTH_H = (13,14); MOUTH_W = (78,308)
 
 def _ear6(p):
     d = lambda a,b: np.linalg.norm(p[a]-p[b])
-    num = d(1,5) + d(2,4); den = 2.0*d(0,3)
+    num = d(1,5)+d(2,4); den = 2.0*d(0,3)
     return (num/den) if den>1e-6 else 0.0
 def compute_EAR(pts): return 0.5*(_ear6(pts[LE])+_ear6(pts[RE]))
 def compute_MAR(pts):
@@ -179,10 +141,7 @@ class PERCLOSWindow:
         return sum(self.buf)/len(self.buf) if self.buf else 0.0
 
 class EventRateWin:
-    """Cuenta eventos; expone (rate_per_min, coverage_s).
-       - rate_per_min = eventos en últimos 60 s (no extrapola).
-       - coverage_s   = cuántos segundos reales lleva la ventana poblándose.
-    """
+    """Eventos/min en últimos win_s + cobertura (segundos de ventana poblada)."""
     def __init__(self, win_s=60.0):
         self.win=win_s; self.ts=deque(); self.first=None
     def push(self,t):
@@ -190,17 +149,12 @@ class EventRateWin:
         self._trim(t)
     def _trim(self,tn):
         while self.ts and (tn-self.ts[0]>self.win): self.ts.popleft()
-        if self.first and (tn - self.first > self.win):  # ya tenemos ventana llena
+        if self.first and (tn - self.first > self.win):
             self.first = tn - self.win
-    def rate_and_coverage(self, tn):
+    def rate_and_cov(self, tn):
         self._trim(tn)
-        # rate = cantidad de eventos en últimos win_s (no extrapolada)
-        rate = len(self.ts)
-        # coverage: tiempo observado desde que empezó hasta ahora, acotado en win_s
-        if self.first is None:
-            cov = 0.0
-        else:
-            cov = max(0.0, min(self.win, tn - self.first))
+        rate = len(self.ts)                 # eventos en últimos win_s
+        cov  = 0.0 if self.first is None else max(0.0, min(self.win, tn - self.first))
         return rate, cov
 
 class BlinkDetector:
@@ -211,7 +165,7 @@ class BlinkDetector:
         else:
             if self.closed and self.open_frames>=self.min_open: self.rate.push(t)
             self.closed=False; self.open_frames+=1
-    def rate_cov(self, t): return self.rate.rate_and_coverage(t)
+    def measures(self,t): return self.rate.rate_and_cov(t)
 
 class YawnDetector:
     def __init__(self, th=MAR_YAWN_TH, min_len_frames=5):
@@ -221,50 +175,41 @@ class YawnDetector:
         else:
             if self.opening>=self.min_len: self.rate.push(t)
             self.opening=0
-    def rate_cov(self, t): return self.rate.rate_and_coverage(t)
+    def measures(self,t): return self.rate.rate_and_cov(t)
 
-# ---------------- Clasificador (tabla exacta + confianza) ----------------
+# ---------------- Clasificador exacto + confidencias ----------------
 def closeness_to_range(x,a,b):
     if a<=x<=b: return 1.0
     d=min(abs(x-a),abs(x-b)); return max(0.0, 1.0 - d/max(1.0,(b-a)))
 
-def classify_by_table(perclos, blinks, yawns, blink_confident, yawn_confident)->str:
-    """Aplica tu tabla, pero:
-       - NO usa 'blinks < 6 => MICROSUEÑO' si blink_confident=False.
-       - En SOMNOLENCIA/FATIGA, ignora el criterio de blinks si blink_confident=False.
-       - En YAWNS, puede ignorar criterio si yawn_confident=False (opcional).
-    """
-    # MICROSUEÑO por PERCLOS alto siempre válido
+def classify_by_table(perclos, blinks, yawns, blink_conf, yawn_conf)->str:
+    # Micorsueño por PERCLOS alto: siempre
     if perclos > 0.8:
         return "MICROSUEÑO"
-
-    # MICROSUEÑO por blinks muy bajos SOLO si hay confianza de cobertura
-    if blink_confident and blinks < 6:
+    # Microsueño por blinks muy bajos: sólo si hay cobertura
+    if blink_conf and blinks < 6:
         return "MICROSUEÑO"
 
-    # SOMNOLENCIA: requiere yawns>4 (si hay confianza) + perclos rango
-    somno_blinks_ok = (6 <= blinks <= 12) if blink_confident else True  # si no hay confianza, no bloquea
-    somno_yawns_ok = (yawns > 4) if yawn_confident else True            # opcionalmente flexible
+    somno_blinks_ok = (6 <= blinks <= 12) if blink_conf else True
+    somno_yawns_ok  = (yawns > 4) if yawn_conf else True
     if 0.4 <= perclos <= 0.8 and somno_blinks_ok and somno_yawns_ok:
         return "SOMNOLENCIA"
 
-    # FATIGA
-    fatiga_blinks_ok = (12 <= blinks <= 16) if blink_confident else True
-    fatiga_yawns_ok  = (1 <= yawns <= 4) if yawn_confident else True
+    fatiga_blinks_ok = (12 <= blinks <= 16) if blink_conf else True
+    fatiga_yawns_ok  = (1 <= yawns <= 4) if yawn_conf else True
     if 0.3 <= perclos < 0.4 and fatiga_blinks_ok and fatiga_yawns_ok:
         return "FATIGA"
 
-    # NORMAL (aquí sí conviene exigir blinks si ya hay confianza; si no, permitimos NORMAL por perclos+yawns)
-    normal_blinks_ok = (17 <= blinks <= 25) if blink_confident else True
-    normal_yawns_ok  = (0 <= yawns <= 1) if yawn_confident else True
+    normal_blinks_ok = (17 <= blinks <= 25) if blink_conf else True
+    normal_yawns_ok  = (0 <= yawns <= 1) if yawn_conf else True
     if perclos < 0.3 and normal_blinks_ok and normal_yawns_ok:
         return "NORMAL"
 
     # Fallback por cercanía
     scores={
-        "NORMAL"      : (0.3-perclos if perclos<0.3 else 0)+ (closeness_to_range(blinks,17,25) if blink_confident else 0.5) + (closeness_to_range(yawns,0,1) if yawn_confident else 0.5),
-        "FATIGA"      : closeness_to_range(perclos,0.3,0.4) + (closeness_to_range(blinks,12,16) if blink_confident else 0.5) + (closeness_to_range(yawns,1,4) if yawn_confident else 0.5),
-        "SOMNOLENCIA" : closeness_to_range(perclos,0.4,0.8) + (closeness_to_range(blinks,6,12) if blink_confident else 0.5) + ((1.0 if yawn_confident and yawns>4 else 0.5))
+        "NORMAL"      : (0.3-perclos if perclos<0.3 else 0)+ (closeness_to_range(blinks,17,25) if blink_conf else 0.5) + (closeness_to_range(yawns,0,1) if yawn_conf else 0.5),
+        "FATIGA"      : closeness_to_range(perclos,0.3,0.4) + (closeness_to_range(blinks,12,16) if blink_conf else 0.5) + (closeness_to_range(yawns,1,4) if yawn_conf else 0.5),
+        "SOMNOLENCIA" : closeness_to_range(perclos,0.4,0.8) + (closeness_to_range(blinks,6,12)  if blink_conf else 0.5) + ((1.0 if yawn_conf and yawns>4 else 0.5))
     }
     if perclos>0.75:
         return "SOMNOLENCIA"
@@ -273,7 +218,7 @@ def classify_by_table(perclos, blinks, yawns, blink_confident, yawn_confident)->
 # ---------------- MQTT ----------------
 def init_mqtt(host, port, client_id):
     if mqtt is None:
-        print("[MQTT] paho no disponible — consola"); return None
+        print("[MQTT] paho no disponible — modo consola"); return None
     c = mqtt.Client(client_id=client_id)
     try: c.connect(host,port,60); c.loop_start(); print("[MQTT] conectado"); return c
     except Exception as e: print("[MQTT] fallo:",e); return None
@@ -286,147 +231,93 @@ def mqtt_publish(client, topic, payload)->bool:
         return r.is_published()
     except Exception: return False
 
-# ---------------- Alert Manager (escalamiento + histéresis) ----------------
-class AlertManager:
-    def __init__(self, mqtt_client, topic="fatiga/alerta"):
-        self.level=0; self.last_state="NORMAL"; self.state_since=now(); self.recover_since=None
-        self.mqtt=mqtt_client; self.topic=topic
-    def update(self, estado:str):
-        t=now()
-        if estado!=self.last_state:
-            self.last_state=estado; self.state_since=t; self.recover_since=None
-        dur = t-self.state_since
-        target=0
-        if estado=="SOMNOLENCIA":
-            if dur>=SOMNO_LVL3_S: target=3
-            elif dur>=SOMNO_LVL2_S: target=2
-            elif dur>=SOMNO_LVL1_S: target=1
-        elif estado=="MICROSUEÑO": target=3
-        elif estado=="FATIGA":
-            if dur>=FATIGA_LVL2_S: target=2
-            elif dur>=FATIGA_LVL1_S: target=1
+# ---------------- Camera backends ----------------
+class CamBase:
+    def start(self): ...
+    def read(self): ...
+    def stop(self): ...
 
-        if estado=="NORMAL":
-            self.recover_since = self.recover_since or t
-            if (t-self.recover_since)>=RECOVERY_DOWN_S: target=max(0, self.level-1)
-            else: target=max(target, self.level)
+class CamPicam2(CamBase):
+    def __init__(self, size, fps):
+        self.size=size; self.fps=fps; self.cam=None; self.last=now(); self._fps=0.0
+    def start(self):
+        self.cam = Picamera2()
+        cfg = self.cam.create_video_configuration(main={"size": self.size, "format": "RGB888"})
+        self.cam.configure(cfg); self.cam.start()
+    def read(self):
+        rgb = self.cam.capture_array()  # RGB
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        t = now(); self._fps = 1.0/max(1e-3, t-self.last); self.last=t
+        return True, bgr, self._fps
+    def stop(self):
+        try: self.cam.stop()
+        except Exception: pass
 
-        if target!=self.level:
-            self.level=target
-            mqtt_publish(self.mqtt, self.topic, {"ts":int(t),"level":int(target)})
-
-# ---------------- Telemetry store-and-forward ----------------
-class TelemetryBuffer:
-    def __init__(self, path="/tmp/telemetry.jsonl", device_id="EDGE"):
-        self.path=path; self.seq=0; self.device_id=device_id
-    def enqueue(self, payload:dict):
-        payload.setdefault("device_id", self.device_id)
-        payload.setdefault("v",1)
-        payload["seq"]=self.seq; self.seq+=1
-        with open(self.path,"a") as f: f.write(json.dumps(payload)+"\n")
-    def flush(self, client, topic:str):
-        try: lines=open(self.path,"r").readlines()
-        except FileNotFoundError: return
-        sent=0
-        for ln in lines:
-            p=json.loads(ln)
-            if mqtt_publish(client, topic, p): sent+=1
-            else: break
-        if sent:
-            with open(self.path,"w") as f:
-                for ln in lines[sent:]: f.write(ln)
-
-# ---------------- Health / Profiler ----------------
-class HealthProfiler(threading.Thread):
-    def __init__(self, mqtt_client, device_id, face_seen_flag, get_fps_cam, get_fps_mesh,
-                 topic="telemetry/health"):
-        super().__init__(daemon=True)
-        self.mqtt=mqtt_client; self.topic=topic; self.did=device_id
-        self.face_seen_flag=face_seen_flag; self.get_fps_cam=get_fps_cam; self.get_fps_mesh=get_fps_mesh
-        self.last_beat={"T0":now(),"T1":now(),"T2":now(),"T3":now(),"T4":now()}
-        self.no_face_since=None
-    def beat(self,name): self.last_beat[name]=now()
-    def read_temp(self)->float:
-        try:
-            p="/sys/class/thermal/thermal_zone0/temp"
-            return int(open(p).read().strip())/1000.0
-        except Exception: return -1.0
-    def run(self):
-        while not stop.is_set():
-            time.sleep(2.0); t=now()
-            stalled=[k for k,v in self.last_beat.items() if (t-v)>5.0]
-            if self.face_seen_flag.is_set():
-                self.no_face_since=None; self.face_seen_flag.clear()
-            else:
-                self.no_face_since = self.no_face_since or t
-            no_face = 0 if self.no_face_since is None else int(t-self.no_face_since)
-            payload={"v":1,"device_id":self.did,"ts":int(t),
-                     "fps_cam":round(self.get_fps_cam(),1),
-                     "fps_mesh":round(self.get_fps_mesh(),1),
-                     "temp_c":round(self.read_temp(),1),
-                     "stalled":stalled,"no_face_s":no_face}
-            mqtt_publish(self.mqtt, self.topic, payload)
+class CamV4L2(CamBase):
+    def __init__(self, size, fps):
+        self.size=size; self.fps=fps; self.cap=None; self.last=now(); self._fps=0.0
+    def start(self):
+        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT,self.size[1])
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if not self.cap.isOpened():
+            raise RuntimeError("No se pudo abrir /dev/video0 con V4L2")
+    def read(self):
+        ok,bgr = self.cap.read()
+        if not ok: return False, None, 0.0
+        t = now(); self._fps = 1.0/max(1e-3, t-self.last); self.last=t
+        return True, bgr, self._fps
+    def stop(self):
+        try: self.cap.release()
+        except Exception: pass
 
 # ---------------- Threads ----------------
 class T0Capture(threading.Thread):
-    def __init__(self, health:HealthProfiler):
-        super().__init__(daemon=True); self.health=health
-        self.cam=None; self.last=now(); self.fps=0.0
-    def get_fps(self): return self.fps
+    def __init__(self, backend="auto"):
+        super().__init__(daemon=True)
+        self.backend=backend; self.cam=None; self.fps=0.0
     def run(self):
-        self.cam=cv2.VideoCapture(0)
-        self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_SIZE[0])
-        self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT,CAM_SIZE[1])
-        self.cam.set(cv2.CAP_PROP_FPS, TARGET_FPS)
-        if not self.cam.isOpened(): raise RuntimeError("No se pudo abrir cámara")
-        while not stop.is_set():
-            ok,bgr=self.cam.read()
-            if not ok: continue
-            t=now(); self.fps = 1.0/max(1e-3, t-self.last); self.last=t
-            put_drop(q_frame, Frame(ts=t,bgr=bgr,fps=self.fps))
-            self.health.beat("T0")
+        # selección de backend
+        if self.backend=="picam2" or (self.backend=="auto" and PICAM2_OK):
+            try:
+                self.cam = CamPicam2(CAM_SIZE, TARGET_FPS); self.cam.start()
+                print("[CAM] Picamera2 activo"); backend_ok=True
+            except Exception as e:
+                print("[CAM] Picamera2 falló:", e); backend_ok=False
+        else:
+            backend_ok=False
 
-class T1Detect(threading.Thread):
-    def __init__(self, health:HealthProfiler):
-        super().__init__(daemon=True); self.health=health
-        self.det=MPFaceDetector(); self.period=1.0/DETECT_HZ; self.last=0; self.roi=(0,0,0,0)
+        if not backend_ok:
+            self.cam = CamV4L2(CAM_SIZE, TARGET_FPS); self.cam.start()
+            print("[CAM] V4L2 activo")
+
+        while not stop.is_set():
+            ok, bgr, fps = self.cam.read()
+            if not ok: continue
+            self.fps=fps
+            put_drop(q_frame, Frame(ts=now(), bgr=bgr, fps=fps))
+        self.cam.stop()
+
+    def get_fps(self): return self.fps
+
+class T2FaceMesh(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True); self.fm=MPFaceMesh()
+        self.period=1.0/FACEMESH_HZ; self.last=0.0
     def run(self):
         while not stop.is_set():
             fr = get_latest(q_frame) or q_frame.get()
             if (now()-self.last) < self.period:
-                put_drop(q_roi, FaceROI(ts=fr.ts, xyxy=self.roi, conf=0.0)); time.sleep(0.002); continue
+                time.sleep(0.001); continue
             self.last=now()
-            out = self.det(fr.bgr)
-            if out is not None: self.roi, conf = out
-            put_drop(q_roi, FaceROI(ts=fr.ts, xyxy=self.roi, conf=1.0))
-            self.health.beat("T1")
-
-class T2FaceMesh(threading.Thread):
-    def __init__(self, health:HealthProfiler):
-        super().__init__(daemon=True); self.fm=MPFaceMesh()
-        self.period=1.0/FACEMESH_HZ; self.last=0; self.fps=0.0
-        self.face_seen_flag = health.face_seen_flag; self.health=health
-    def get_fps(self): return self.fps
-    def run(self):
-        while not stop.is_set():
-            fr = get_latest(q_frame) or q_frame.get()
-            roi = get_latest(q_roi) or FaceROI(ts=fr.ts, xyxy=(0,0,0,0), conf=0.0)
-            if (now()-self.last) < self.period: time.sleep(0.001); continue
-            self.last=now(); t0=now()
-            x1,y1,x2,y2 = roi.xyxy
-            crop = fr.bgr[y1:y2, x1:x2] if (x2>x1 and y2>y1) else fr.bgr
-            pts = self.fm(crop)
+            pts = self.fm(fr.bgr)   # full-frame (sin ROI por defecto)
             if pts is not None:
-                if crop is not fr.bgr:
-                    pts[:,0]+=x1; pts[:,1]+=y1
                 put_drop(q_lm, Landmarks(ts=fr.ts, pts=pts))
-                self.face_seen_flag.set()
-            self.fps = 1.0/max(1e-3, now()-t0)
-            self.health.beat("T2")
 
 class T3Features(threading.Thread):
-    def __init__(self, health:HealthProfiler):
-        super().__init__(daemon=True); self.health=health
+    def __init__(self):
+        super().__init__(daemon=True)
         self.ema_e, self.ema_m = EMA(0.25), EMA(0.25)
         self.perclos = PERCLOSWindow(PERCLOS_WINDOW_SEC, FACEMESH_HZ)
         self.blinks  = BlinkDetector(EAR_BLINK_TH,2)
@@ -437,96 +328,70 @@ class T3Features(threading.Thread):
             ear = compute_EAR(lm.pts); mar=compute_MAR(lm.pts)
             ear_s, mar_s = self.ema_e(ear), self.ema_m(mar)
             p = self.perclos.update(eye_closed=(ear_s<EAR_BLINK_TH))
-            self.blinks.update(ear_s, lm.ts); self.yawns.update(mar_s, lm.ts)
-            bl_rate, bl_cov = self.blinks.rate_cov(lm.ts)
-            yw_rate, yw_cov = self.yawns.rate_cov(lm.ts)
-            feat = Features(ts=lm.ts, ear=ear_s, mar=mar_s, perclos=p,
-                            blinks=bl_rate, yawns=yw_rate,
-                            blink_cov_s=bl_cov, yawn_cov_s=yw_cov)
-            put_drop(q_feat, feat)
-            self.health.beat("T3")
+            self.blinks.update(ear_s, lm.ts)
+            self.yawns.update(mar_s, lm.ts)
+            bl, bl_cov = self.blinks.measures(lm.ts)
+            yw, yw_cov = self.yawns.measures(lm.ts)
+            put_drop(q_feat, Features(ts=lm.ts, ear=ear_s, mar=mar_s, perclos=p,
+                                      blinks=bl, yawns=yw,
+                                      blink_cov_s=bl_cov, yawn_cov_s=yw_cov))
 
-# ---------------- Decisión + Alerts + Telemetry ----------------
 class T4Decision(threading.Thread):
-    def __init__(self, client, device_id, alert_mgr:AlertManager,
-                 telemetry:TelemetryBuffer, state_topic="fatiga/estado"):
+    def __init__(self, client_id, mqtt_client, topic="fatiga/estado"):
         super().__init__(daemon=True)
-        self.client=client; self.did=device_id; self.alert=alert_mgr
-        self.telemetry=telemetry; self.topic=state_topic
-        self.estado_last=None
+        self.did = client_id; self.mqtt=mqtt_client; self.topic=topic
+        self.last_pub = 0.0
     def run(self):
         while not stop.is_set():
             f = q_feat.get()
-
-            # Confianza por cobertura temporal:
             blink_conf = (f.blink_cov_s >= MIN_COVERAGE_BLINKS_S)
             yawn_conf  = (f.yawn_cov_s  >= MIN_COVERAGE_YAWNS_S)
-
             estado = classify_by_table(f.perclos, f.blinks, f.yawns, blink_conf, yawn_conf)
 
-            if VERBOSE:
-                vprint(f"[DEC] ts={int(f.ts)} P={f.perclos:.3f} BL={f.blinks}({f.blink_cov_s:.0f}s) "
-                       f"YW={f.yawns}({f.yawn_cov_s:.0f}s) -> {estado} "
-                       f"[blink_conf={blink_conf} yawn_conf={yawn_conf}]")
-
-            payload={"device_id":self.did,"estado":estado,
-                     "perclos":round(f.perclos,3),
-                     "blinks":int(f.blinks),"yawns":int(f.yawns),
-                     "ts":int(f.ts)}
-
-            # store-and-forward (enfiletar SIEMPRE) + flush oportunista
-            self.telemetry.enqueue(payload)
-            self.telemetry.flush(self.client, self.topic)
-
-            # alerts
-            self.alert.update(estado)
-            self.estado_last=estado
+            # Publicación a 1 Hz
+            tnow = now()
+            if (tnow - self.last_pub) >= (1.0 / PUBLISH_HZ):
+                payload = {
+                    "device_id": self.did,
+                    "estado": estado,
+                    "perclos": round(float(f.perclos), 2),
+                    "blinks": int(f.blinks),   # eventos/min últimos 60 s (entero)
+                    "yawns": int(f.yawns),     # eventos/min últimos 60 s (entero)
+                    "ts": int(f.ts)
+                }
+                mqtt_publish(self.mqtt, self.topic, payload)
+                self.last_pub = tnow
 
 # ---------------- Main ----------------
 def main():
-    global VERBOSE
     ap=argparse.ArgumentParser()
-    ap.add_argument("--client_id", default="EDGE_RPI")
+    ap.add_argument("--client_id", default="RPI 5")
     ap.add_argument("--mqtt_host", default="localhost")
     ap.add_argument("--mqtt_port", type=int, default=1883)
-    ap.add_argument("--verbose", action="store_true", help="Logs detallados")
+    ap.add_argument("--camera", choices=["auto","picam2","v4l2"], default="auto",
+                    help="Preferir Picamera2 (libcamera) o V4L2")
+    ap.add_argument("--use_roi", action="store_true",
+                    help="(Opcional) usar Face Detection para ROI (NO recomendado si apenas pruebas)")
     args=ap.parse_args()
-    VERBOSE = args.verbose
 
+    # MQTT
     client = init_mqtt(args.mqtt_host, args.mqtt_port, args.client_id)
 
-    face_seen_flag = threading.Event()
-    # dummy getters; se rellenan con instancias reales
-    get_cam_fps = lambda: 0.0
-    get_mesh_fps= lambda: 0.0
-
-    # Health
-    health = HealthProfiler(client, args.client_id, face_seen_flag, lambda: get_cam_fps(), lambda: get_mesh_fps())
-    # Telemetry buffer y Alerts
-    telemetry = TelemetryBuffer("/tmp/telemetry.jsonl", args.client_id)
-    alert_mgr = AlertManager(client, "fatiga/alerta")
-
     # Threads
-    t0 = T0Capture(health)
-    t1 = T1Detect(health)
-    t2 = T2FaceMesh(health)
-    t3 = T3Features(health)
-    t4 = T4Decision(client, args.client_id, alert_mgr, telemetry, "fatiga/estado")
+    t0 = T0Capture(backend=args.camera)
+    t2 = T2FaceMesh()
+    t3 = T3Features()
+    t4 = T4Decision(args.client_id, client, "fatiga/estado")
 
-    # vincular getters reales
-    def _gc(): return t0.get_fps()
-    def _gm(): return t2.get_fps()
-    health.get_fps_cam=_gc; health.get_fps_mesh=_gm
-
-    for t in (health,t0,t1,t2,t3,t4): t.start()
-    print("[MAIN] Corriendo. Ctrl+C para salir. (Usa --verbose para logs)")
+    for t in (t0,t2,t3,t4): t.start()
+    print("[MAIN] Corriendo. Ctrl+C para salir. Cámara:", args.camera, "| ROI:", args.use_roi)
     try:
         while not stop.is_set(): time.sleep(0.05)
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
-        for t in (t4,t3,t2,t1,t0,health):
+        for t in (t4,t3,t2,t0):
             t.join(timeout=1.0)
         print("[MAIN] Bye.")
 
