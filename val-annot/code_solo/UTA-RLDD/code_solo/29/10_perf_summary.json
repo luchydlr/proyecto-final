@@ -1,0 +1,17 @@
+{
+  "video": "10.mp4",
+  "frames_processed": 10714,
+  "wall_time_s": 357.47,
+  "effective_fps": 29.97,
+  "frame_ms_avg": 33.28,
+  "frame_ms_median": 31.68,
+  "frame_ms_p90": 36.86,
+  "frame_ms_max": 119.89,
+  "cpu_percent_avg": 134.4,
+  "rss_memory_mb_avg": 211.7,
+  "cpu_temp_c": 71.9,
+  "threads_used": 2,
+  "fps_nominal_from_file": 16.67,
+  "width": 1280,
+  "height": 720
+}

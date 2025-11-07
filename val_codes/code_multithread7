@@ -1,0 +1,376 @@
+# ============================================
+# Código 2 (pipeline multihilo → batch videos)
+# Salidas por video (igual que batch_code1.py)
+# ============================================
+
+import os, csv, math, json, time, statistics, shutil, subprocess, threading, glob
+from collections import deque
+import numpy as np
+import cv2
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+# ====== RUTAS / CONFIG (EDITA AQUÍ) ======
+MODEL_PATH   = "/home/lucianadelarosa/Desktop/proyecto-final/facemesh/face_landmarker.task"
+INPUT_DIR    = "/home/lucianadelarosa/Desktop/UTA-RLDD/01"
+OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_mth7/UTA-RLDD/01"
+EXTS         = (".mp4", ".mov", ".avi", ".mkv", ".MOV")
+AGG_INTERVAL_S = 2
+RECURSIVE    = False
+SKIP_IF_EXISTS = True
+RATES_WINDOW_S = 60.0
+
+# ====== UMBRALES/LOGICA IGUAL A TU CODIGO 2 ======
+FRAMES_INTERVAL      = 30
+PERCLOS_WINDOW_S     = 60.0
+MIN_CLOSE_MS         = 200
+MICROSLEEP_FRAMES    = 15
+EYE_CLOSED_THRESHOLD = 0.009
+YAWN_MAR_THRESHOLD   = 0.65
+YAWN_HOLD_FRAMES     = 5
+
+BLINK_MICRO_MAX   = 6.0
+BLINK_SOMNO_MAX   = 12.0
+BLINK_FATIGA_MAX  = 20.0
+BLINK_NORM_MIN    = 17.0
+BLINK_NORM_MAX    = 25.0
+YAWN_FATIGA_MIN   = 1.0
+YAWN_FATIGA_MAX   = 4.0
+YAWN_SOMNO_MIN    = 4.0
+
+# ====== HELPERS ======
+def discover_videos(folder: str, exts=EXTS, recursive=False):
+    pattern = "**/*" if recursive else "*"
+    paths = [p for p in glob.glob(os.path.join(folder, pattern), recursive=recursive)
+             if os.path.splitext(p)[1].lower() in exts]
+    return sorted(paths)
+
+def build_detector(model_path: str):
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Modelo no encontrado: {model_path}")
+    base_options = mp_python.BaseOptions(model_asset_path=model_path)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+def euclidean(a, b):
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+def eye_aspect_ratio_like(landmarks, right=True):
+    if right:  top, bottom = landmarks[145], landmarks[159]
+    else:      top, bottom = landmarks[374], landmarks[386]
+    return euclidean(top, bottom)
+
+def mouth_aspect_ratio(landmarks):
+    vertical_pairs = [(13, 14), (82, 87), (312, 317)]
+    horizontals = (78, 308)
+    v = np.mean([euclidean(landmarks[a], landmarks[b]) for a, b in vertical_pairs])
+    h = euclidean(landmarks[horizontals[0]], landmarks[horizontals[1]])
+    return (v / h) if h > 0 else 0.0
+
+def safe_open_csv(path, header):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, 'w', newline='', encoding='utf-8')
+    w = csv.writer(f)
+    w.writerow(header)
+    return f, w
+
+def read_cpu_temp_c():
+    try:
+        if shutil.which("vcgencmd"):
+            out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode("utf-8").strip()
+            val = out.split("=")[1].split("'")[0]
+            return float(val)
+    except Exception:
+        pass
+    return None
+
+# ====== PIPELINE POR VIDEO ======
+def process_video(video_path: str, out_dir: str, agg_interval_s: int = 2):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    out_csv_frame = os.path.join(out_dir, f"{base}_per_frame.csv")
+    out_csv_int   = os.path.join(out_dir, f"{base}_per_{agg_interval_s}s.csv")
+    out_perf_json = os.path.join(out_dir, f"{base}_perf_summary.json")
+    out_perf_csv  = os.path.join(out_dir, f"{base}_perf_summary.csv")
+
+    if SKIP_IF_EXISTS and os.path.exists(out_csv_frame) and os.path.exists(out_csv_int):
+        print(f"⏭️  Ya existe salida para '{base}', omitiendo.")
+        return
+
+    det = build_detector(MODEL_PATH)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ No se pudo abrir: {video_path}")
+        det.close(); return
+
+    fps_nom = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps_nom = max(5.0, min(120.0, fps_nom))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 640)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    dt_ms = 1000.0 / fps_nom
+    frames_per_int = int(round(agg_interval_s * fps_nom))
+
+    # Estados/ventanas como en tu MetricsWorker
+    frames_cnt = 0
+    closed_frames = 0
+    closed_streak = 0
+    microsleep_flag = False
+    blink_count_win = 0
+    yawn_count_win  = 0
+    eyes_closed_prev = False
+    yawn_frames = 0
+    window_start_ts = time.time()
+
+    # Sliding 60s
+    events_win = deque()              # (ts_s, 'blink'|'yawn')
+    perclos_win = deque()             # (ts_s, credited_ms, elapsed_ms)
+    perclos_win_closed = 0.0
+    perclos_win_elapsed = 0.0
+
+    run_ms_buffer = 0.0
+    eye_closed_prev_bool = False
+
+    # CSVs
+    f_pf, w_pf = safe_open_csv(
+        out_csv_frame,
+        ["Frame_ID","Timestamp_s","EAR_like_L","EAR_like_R","MAR",
+         "EyesClosed","BlinkEvent","YawnEvent","Blinks_acc","Yawns_acc",
+         "ClosedRun_ms","PERCLOS_win60s","Blinks_per_min","Yawns_per_min"]
+    )
+    f_pi, w_pi = safe_open_csv(
+        out_csv_int,
+        ["Second","PERCLOS_prop","Blinks","Yawns","Avg_EAR_like_L","Avg_EAR_like_R","Avg_MAR"]
+    )
+
+    # promedios por intervalo
+    int_idx = 0
+    int_elapsed_ms = 0.0
+    int_closed_ms  = 0.0
+    int_blinks = 0
+    int_yawns  = 0
+    int_earL_sum = 0.0; int_earL_cnt = 0
+    int_earR_sum = 0.0; int_earR_cnt = 0
+    int_mar_sum  = 0.0; int_mar_cnt  = 0
+
+    # rendimiento
+    t0 = time.perf_counter()
+    frame_ms_list = []
+    if psutil:
+        proc = psutil.Process(os.getpid())
+        cpu_samples = []; rss_samples = []
+        _ = proc.cpu_percent(interval=None)
+    else:
+        proc = None
+
+    idx = 0
+    blinks_acc = 0
+    yawns_acc  = 0
+    max_closed_run_ms_current = 0.0
+
+    try:
+        while True:
+            t_frame_start = time.perf_counter()
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = det.detect(mp_img)
+
+            ts_s = idx / fps_nom
+            ear_l = ear_r = mar = None
+            eyes_closed = 0
+            blink_event = 0
+            yawn_event  = 0
+
+            if res.face_landmarks:
+                lms = res.face_landmarks[0]
+                ear_r = eye_aspect_ratio_like(lms, right=True)
+                ear_l = eye_aspect_ratio_like(lms, right=False)
+                mar   = mouth_aspect_ratio(lms)
+                eyes_closed = 1 if (ear_r < EYE_CLOSED_THRESHOLD and ear_l < EYE_CLOSED_THRESHOLD) else 0
+
+            # racha + min duración (backfill)
+            if eyes_closed:
+                run_ms_buffer += dt_ms
+                int_closed_ms += dt_ms
+                if run_ms_buffer >= MIN_CLOSE_MS and not eye_closed_prev_bool:
+                    perclos_win.append((ts_s, run_ms_buffer, run_ms_buffer))
+                    perclos_win_closed  += run_ms_buffer
+                    perclos_win_elapsed += run_ms_buffer
+                elif run_ms_buffer >= MIN_CLOSE_MS:
+                    perclos_win.append((ts_s, dt_ms, dt_ms))
+                    perclos_win_closed  += dt_ms
+                    perclos_win_elapsed += dt_ms
+                if run_ms_buffer > max_closed_run_ms_current:
+                    max_closed_run_ms_current = run_ms_buffer
+            else:
+                if eye_closed_prev_bool:
+                    if MIN_CLOSE_MS <= run_ms_buffer <= 500:
+                        blinks_acc += 1; blink_event = 1; int_blinks += 1
+                        events_win.append((ts_s, 'blink'))
+                run_ms_buffer = 0.0
+
+            # Yawn por MAR (mantén si quieres un buffer tipo “hold”)
+            # yawn_event/int_yawns/yawns_acc -> puedes replicar el hold por ms aquí si lo necesitas
+
+            # ventana corta tipo FRAMES_INTERVAL (para tasas/min al estilo de tu hilo)
+            frames_cnt += 1
+            if eyes_closed: closed_frames += 1; closed_streak += 1
+            else:           closed_streak = 0
+            if not eyes_closed_prev and eyes_closed:
+                eyes_closed_prev = True
+            elif eyes_closed_prev and not eyes_closed:
+                blink_count_win += 1
+                eyes_closed_prev = False
+
+            if mar is not None:
+                if mar > YAWN_MAR_THRESHOLD:  yawn_frames += 1
+                else:
+                    if yawn_frames > YAWN_HOLD_FRAMES: yawn_count_win += 1
+                    yawn_frames = 0
+
+            if closed_streak >= MICROSLEEP_FRAMES:
+                microsleep_flag = True
+
+            if frames_cnt >= FRAMES_INTERVAL:
+                elapsed = max(time.time() - window_start_ts, 1e-3)
+                perclos_pct_win = 100.0 * (closed_frames / float(max(1, FRAMES_INTERVAL)))
+                blink_rate = (blink_count_win * 60.0) / elapsed
+                yawn_rate  = (yawn_count_win  * 60.0) / elapsed
+                # (si quisieras volcar esto a otro CSV, puedes hacerlo aquí)
+                frames_cnt = 0; closed_frames = 0; closed_streak = 0
+                microsleep_flag = False
+                blink_count_win = 0; yawn_count_win = 0
+                window_start_ts = time.time()
+
+            # purga 60 s
+            limit_ts = ts_s - RATES_WINDOW_S
+            while events_win and events_win[0][0] < limit_ts:
+                events_win.popleft()
+            while perclos_win and perclos_win[0][0] < limit_ts:
+                _, c_ms, e_ms = perclos_win.popleft()
+                perclos_win_closed  -= c_ms
+                perclos_win_elapsed -= e_ms
+
+            blinks_per_min = (sum(1 for t,e in events_win if e=='blink') * (60.0 / RATES_WINDOW_S))
+            yawns_per_min  = (sum(1 for t,e in events_win if e=='yawn')  * (60.0 / RATES_WINDOW_S))
+            perclos_prop_win = (perclos_win_closed / perclos_win_elapsed) if perclos_win_elapsed > 0 else 0.0
+
+            # per-frame CSV
+            def f(x, nd=4): return "" if x is None else f"{x:.{nd}f}"
+            w_pf.writerow([
+                idx, f"{ts_s:.3f}", f(ear_l), f(ear_r), f(mar),
+                eyes_closed, blink_event, yawn_event, blinks_acc, yawns_acc,
+                f(max_closed_run_ms_current, 1),
+                f"{perclos_prop_win:.3f}",
+                f"{blinks_per_min:.2f}", f"{yawns_per_min:.2f}"
+            ])
+
+            # agregación por intervalo (prop simple con ms del intervalo)
+            int_elapsed_ms += dt_ms
+            if ear_l is not None: int_earL_sum += ear_l; int_earL_cnt += 1
+            if ear_r is not None: int_earR_sum += ear_r; int_earR_cnt += 1
+            if mar   is not None: int_mar_sum  += mar;   int_mar_cnt  += 1
+
+            if ((idx + 1) % frames_per_int) == 0:
+                perclos_prop_int = (int_closed_ms / max(1.0, int_elapsed_ms))
+                avgL = (int_earL_sum / int_earL_cnt) if int_earL_cnt > 0 else ""
+                avgR = (int_earR_sum / int_earR_cnt) if int_earR_cnt > 0 else ""
+                avgM = (int_mar_sum  / int_mar_cnt)  if int_mar_cnt  > 0 else ""
+                w_pi.writerow([
+                    int_idx*agg_interval_s,
+                    f"{perclos_prop_int:.3f}",
+                    int_blinks, int_yawns,
+                    f"{avgL:.4f}" if avgL != "" else "",
+                    f"{avgR:.4f}" if avgR != "" else "",
+                    f"{avgM:.4f}" if avgM != "" else "",
+                ])
+                int_idx += 1
+                int_elapsed_ms = 0.0
+                int_closed_ms  = 0.0
+                int_blinks = 0
+                int_yawns  = 0
+                int_earL_sum = int_earR_sum = int_mar_sum = 0.0
+                int_earL_cnt = int_earR_cnt = int_mar_cnt = 0
+                max_closed_run_ms_current = 0.0
+
+            # rendimiento
+            frame_ms_list.append((time.perf_counter() - t_frame_start) * 1000.0)
+            if psutil and (idx % int(max(1, round(fps_nom)))) == 0:
+                try:
+                    cpu_pct = psutil.Process(os.getpid()).cpu_percent(interval=None)
+                    mem_mb  = psutil.Process(os.getpid()).memory_info().rss / (1024*1024)
+                    cpu_samples.append(cpu_pct)
+                    rss_samples.append(mem_mb)
+                except Exception:
+                    pass
+
+            eye_closed_prev_bool = bool(eyes_closed)
+            idx += 1
+
+    finally:
+        cap.release()
+        det.close()
+        f_pf.close()
+        f_pi.close()
+
+    # resumen rendimiento
+    wall = time.perf_counter() - t0
+    frames_done = len(frame_ms_list)
+    eff_fps = frames_done / wall if wall > 0 else 0.0
+    frame_ms_avg = sum(frame_ms_list)/frames_done if frames_done else 0.0
+    frame_ms_med = statistics.median(frame_ms_list) if frame_ms_list else 0.0
+    frame_ms_p90 = float(np.percentile(frame_ms_list, 90)) if frame_ms_list else 0.0
+    frame_ms_max = max(frame_ms_list) if frame_ms_list else 0.0
+    cpu_pct_avg  = float(np.mean(cpu_samples)) if psutil and cpu_samples else None
+    rss_mb_avg   = float(np.mean(rss_samples)) if psutil and rss_samples else None
+    cpu_temp_c   = read_cpu_temp_c()
+
+    perf = {
+        "video": os.path.basename(video_path),
+        "frames_processed": frames_done,
+        "wall_time_s": round(wall, 3),
+        "effective_fps": round(eff_fps, 2),
+        "frame_ms_avg": round(frame_ms_avg, 2),
+        "frame_ms_median": round(frame_ms_med, 2),
+        "frame_ms_p90": round(frame_ms_p90, 2),
+        "frame_ms_max": round(frame_ms_max, 2),
+        "cpu_percent_avg": round(cpu_pct_avg, 1) if cpu_pct_avg is not None else None,
+        "rss_memory_mb_avg": round(rss_mb_avg, 1) if rss_mb_avg is not None else None,
+        "cpu_temp_c": cpu_temp_c,
+        "threads_used": threading.active_count(),
+        "fps_nominal_from_file": round(fps_nom, 2),
+        "width": W,
+        "height": H
+    }
+
+    with open(out_perf_json, "w", encoding="utf-8") as jf:
+        json.dump(perf, jf, ensure_ascii=False, indent=2)
+    with open(out_perf_csv, "w", newline="", encoding="utf-8") as cf:
+        cw = csv.writer(cf); cw.writerow(list(perf.keys())); cw.writerow(list(perf.values()))
+
+    print(f"✅ {base}: guardado\n - {out_csv_frame}\n - {out_csv_int}\n - {out_perf_json}\n - {out_perf_csv}")
+
+# ====== BATCH ======
+if __name__ == "__main__":
+    os.makedirs(OUT_DIR, exist_ok=True)
+    vids = discover_videos(INPUT_DIR, EXTS, RECURSIVE)
+    print(f"🔎 Encontrados {len(vids)} videos en {INPUT_DIR}")
+    for i, vp in enumerate(vids, 1):
+        print(f"\n({i}/{len(vids)}) {vp}")
+        try:
+            process_video(vp, OUT_DIR, agg_interval_s=AGG_INTERVAL_S)
+        except Exception as e:
+            print(f"⚠️ Error procesando {vp}: {e}")

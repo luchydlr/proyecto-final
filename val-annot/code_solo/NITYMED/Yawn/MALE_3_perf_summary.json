@@ -1,0 +1,17 @@
+{
+  "video": "MALE_3.mp4",
+  "frames_processed": 560,
+  "wall_time_s": 21.573,
+  "effective_fps": 25.96,
+  "frame_ms_avg": 38.43,
+  "frame_ms_median": 37.05,
+  "frame_ms_p90": 42.34,
+  "frame_ms_max": 73.78,
+  "cpu_percent_avg": 142.0,
+  "rss_memory_mb_avg": 281.5,
+  "cpu_temp_c": 71.4,
+  "threads_used": 2,
+  "fps_nominal_from_file": 25.0,
+  "width": 1920,
+  "height": 1080
+}

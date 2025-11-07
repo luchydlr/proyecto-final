@@ -1,0 +1,574 @@
+# ============================================
+# Batch multithread (Reader → Inference → Metrics/Writer)
+# Genera por video:
+#   - base_per_frame.csv  (EAR, MAR, EyeClosed, Blink/Yawn events, tasas, ClosedRun_ms, Estado)
+#   - base_per_{AGG_INTERVAL_S}s.csv  (Start_s, PERCLOS, Blinks, Yawns, Avg_EAR, Avg_MAR, Mode_Estado)
+#   - base_perf_summary.json / .csv (CPU %, RAM, temp, FPS, etc.)
+# ============================================
+
+import os, glob, csv, math, json, time, statistics, shutil, subprocess, threading, queue
+import numpy as np
+import cv2
+from collections import deque, Counter
+
+# psutil opcional para CPU/RAM promedio
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+# -----------------------------
+# RUTAS / CONFIG (tus valores)
+# -----------------------------
+MODEL_PATH   = "/home/lucianadelarosa/Desktop/proyecto-final/facemesh/face_landmarker.task"
+INPUT_DIR    = "/home/lucianadelarosa/Desktop/UTA-RLDD/01"
+OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_multi/UTA-RLDD/01"
+EXTS         = (".mp4", ".mov", ".avi", ".mkv", ".MOV")
+
+# Tamaño de intervalo para CSV agregado (debe coincidir con tus anotaciones)
+AGG_INTERVAL_S = 2
+
+# Ventana para tasas/min y PERCLOS de clasificación
+RATES_WINDOW_S = 60.0   # 60 s recomendado
+
+# -----------------------------
+# UMBRALES / TIEMPOS (ms)
+# -----------------------------
+EAR_THR_CLOSE = 0.20         # EAR por debajo => ojo cerrado (para blink/PERCLOS)
+EAR_HYST      = 0.06         # histéresis de apertura
+BLINK_MIN_MS  = 60
+BLINK_MAX_MS  = 500
+YAWN_MIN_MS   = 1000
+MICRO_MS      = 1500         # si cierre continuo >= MICRO_MS → MICROSUEÑO (prioritario)
+
+# Bandas de EAR para contribuir al estado (tu pedido)
+EAR_BANDS = {
+    "NORMAL":      (0.25,  1.00),
+    "FATIGA":      (0.21,  0.25),
+    "SOMNOLENCIA": (0.15,  0.21),
+    "MICROSUEÑO":  (0.00,  0.15),
+}
+
+# -----------------------------
+# Landmarks (FaceMesh)
+# -----------------------------
+LEFT_EYE_IDX  = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+MOUTH_VERT_PAIRS = [(13,14), (82,87), (312,317)]
+MOUTH_HORZ = (78, 308)
+
+# -----------------------------
+# Utilidades geométricas
+# -----------------------------
+def hypot2(x1, y1, x2, y2):
+    return math.hypot(x1 - x2, y1 - y2)
+
+def aspect_ratio_6(lms, idxs, w, h):
+    """EAR clásico: (|p2-p6| + |p3-p5|) / (2*|p1-p4|)"""
+    try:
+        p = [(lms[i].x * w, lms[i].y * h) for i in idxs[:6]]
+        (x1,y1),(x2,y2),(x3,y3),(x4,y4),(x5,y5),(x6,y6) = p
+        v1 = hypot2(x2,y2,x6,y6)
+        v2 = hypot2(x3,y3,x5,y5)
+        h1 = hypot2(x1,y1,x4,y4)
+        return (v1 + v2) / (2.0 * h1) if h1 > 0 else None
+    except:
+        return None
+
+def mouth_aspect_ratio_robust(lms, w, h):
+    """MAR robusto: promedio 3 verticales / horizontal 78–308 (con sanity clamp)."""
+    try:
+        vds = []
+        for a,b in MOUTH_VERT_PAIRS:
+            ta = (lms[a].x*w, lms[a].y*h); tb = (lms[b].x*w, lms[b].y*h)
+            vds.append(hypot2(ta[0], ta[1], tb[0], tb[1]))
+        left = (lms[MOUTH_HORZ[0]].x*w, lms[MOUTH_HORZ[0]].y*h)
+        righ = (lms[MOUTH_HORZ[1]].x*w, lms[MOUTH_HORZ[1]].y*h)
+        hd = hypot2(left[0], left[1], righ[0], righ[1])
+        if hd <= 0:
+            return None
+        mar = float(np.mean(vds)) / hd
+        if not (0.05 <= mar <= 1.50):
+            return None
+        return mar
+    except:
+        return None
+
+def safe_open_csv(path, header):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    f = open(path, 'w', newline='', encoding='utf-8')
+    w = csv.writer(f)
+    w.writerow(header)
+    return f, w
+
+def discover_videos(folder: str, exts=EXTS, recursive=False):
+    pattern = "**/*"
+    paths = [p for p in glob.glob(os.path.join(folder, pattern), recursive=True)
+             if os.path.splitext(p)[1].lower() in tuple(e.lower() for e in exts)]
+    return sorted(paths)
+
+# -----------------------------
+# Detector (compat con MediaPipe nuevo/viejo)
+# -----------------------------
+def build_detector(model_path: str, num_threads: int = 4):
+    try:
+        base_options = mp_python.BaseOptions(
+            model_asset_path=model_path,
+            num_threads=num_threads
+        )
+    except TypeError:
+        base_options = mp_python.BaseOptions(model_asset_path=model_path)
+
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+# -----------------------------
+# Métricas de sistema (opcionales)
+# -----------------------------
+def read_cpu_temp_c():
+    """Intenta leer temperatura CPU en Raspberry Pi via vcgencmd."""
+    try:
+        if shutil.which("vcgencmd"):
+            out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode("utf-8").strip()
+            # formato: temp=48.2'C
+            val = out.split("=")[1].split("'")[0]
+            return float(val)
+    except Exception:
+        pass
+    return None
+
+# -----------------------------
+# Estado por bandas (EAR) + tasas + perclos
+# -----------------------------
+RANK = {"NORMAL":0, "FATIGA":1, "SOMNOLENCIA":2, "MICROSUEÑO":3}
+
+def estado_from_ear_bands(ear_val):
+    if ear_val is None:
+        return None
+    for est, (lo, hi) in EAR_BANDS.items():
+        if lo <= ear_val <= hi:
+            return est
+    # fuera de rango: heurística
+    return "MICROSUEÑO" if ear_val < 0.15 else "NORMAL"
+
+def estado_from_rates(perclos_pct, blinks_pm, yawns_pm, closed_run_ms_current):
+    if closed_run_ms_current >= MICRO_MS:
+        return "MICROSUEÑO"
+    # tu tabla base
+    if perclos_pct < 30 and 17 <= blinks_pm <= 25 and yawns_pm <= 1:
+        return "NORMAL"
+    if 30 <= perclos_pct <= 40 and 12 <= blinks_pm <= 16 and 1 <= yawns_pm <= 4:
+        return "FATIGA"
+    if perclos_pct > 40 and 6 <= blinks_pm <= 12 and yawns_pm > 4:
+        return "SOMNOLENCIA"
+    # fallback por PERCLOS
+    if perclos_pct < 30:  return "NORMAL"
+    if perclos_pct <= 40: return "FATIGA"
+    if perclos_pct <= 80: return "SOMNOLENCIA"
+    return "MICROSUEÑO"
+
+def fuse_states(*states):
+    """Devuelve el peor (máxima severidad) ignorando None."""
+    candidates = [s for s in states if s]
+    if not candidates:
+        return "NORMAL"
+    return max(candidates, key=lambda s: RANK.get(s, 0))
+
+# =========================================================
+#                PIPELINE MULTIHILO POR VIDEO
+# =========================================================
+class Reader(threading.Thread):
+    def __init__(self, cap, fps_nom, q_out):
+        super().__init__(daemon=True)
+        self.cap = cap
+        self.fps_nom = fps_nom
+        self.q_out = q_out
+
+    def run(self):
+        idx = 0
+        while True:
+            ok, frame_bgr = self.cap.read()
+            if not ok:
+                break
+            ts = idx / self.fps_nom
+            try:
+                self.q_out.put((idx, ts, frame_bgr), timeout=1.0)
+            except queue.Full:
+                self.q_out.put((idx, ts, frame_bgr))  # bloqueo si está llena
+            idx += 1
+        # fin
+        self.q_out.put(None)  # sentinel
+
+class Inference(threading.Thread):
+    def __init__(self, detector, W, H, q_in, q_out):
+        super().__init__(daemon=True)
+        self.detector = detector
+        self.W = W
+        self.H = H
+        self.q_in = q_in
+        self.q_out = q_out
+
+    def run(self):
+        while True:
+            item = self.q_in.get()
+            if item is None:
+                self.q_out.put(None)
+                break
+            idx, ts, frame_bgr = item
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            res = self.detector.detect(mp_img)
+
+            ear = None; mar = None; has_face = False
+            if res.face_landmarks:
+                has_face = True
+                lms = res.face_landmarks[0]
+                ear_l = aspect_ratio_6(lms, LEFT_EYE_IDX,  self.W, self.H)
+                ear_r = aspect_ratio_6(lms, RIGHT_EYE_IDX, self.W, self.H)
+                # limpieza mínima
+                if ear_l is not None and (ear_l < 0.02 or ear_l > 0.80): ear_l = None
+                if ear_r is not None and (ear_r < 0.02 or ear_r > 0.80): ear_r = None
+                if (ear_l is not None) and (ear_r is not None):
+                    ear = min(ear_l, ear_r)
+                mar = mouth_aspect_ratio_robust(lms, self.W, self.H)
+
+            self.q_out.put((idx, ts, has_face, ear, mar))
+
+class MetricsWriter(threading.Thread):
+    def __init__(self, fps_nom, agg_interval_s, out_csv_frame, out_csv_int,
+                 perf_tracker, q_in):
+        super().__init__(daemon=True)
+        self.fps_nom = fps_nom
+        self.dt_ms = 1000.0 / fps_nom
+        self.FRAMES_PER_INT = int(round(agg_interval_s * fps_nom))
+        self.out_csv_frame = out_csv_frame
+        self.out_csv_int = out_csv_int
+        self.perf = perf_tracker
+        self.q_in = q_in
+
+        # CSV writers
+        self.fout, self.wframe = safe_open_csv(
+            out_csv_frame,
+            ["Frame_ID","Timestamp_s","EAR","MAR","EyeClosed",
+             "BlinkEvent","YawnEvent","Blinks_acc","Yawns_acc","ClosedRun_ms",
+             "Blinks_per_min","Yawns_per_min","Estado"]
+        )
+        self.fsec, self.wint = safe_open_csv(
+            out_csv_int,
+            ["Start_%ss" % (self.FRAMES_PER_INT / self.fps_nom),
+             "PERCLOS","Blinks","Yawns","Avg_EAR","Avg_MAR","Mode_Estado"]
+        )
+
+        # Estado global (por frame)
+        self.eye_closed = 0
+        self.eye_closed_prev = 0
+        self.closed_run_ms = 0.0
+        self.yawn_open_ms  = 0.0
+        self.yawns_acc = 0
+        self.blinks_acc = 0
+
+        # Ventanas deslizantes para 60s (tasas y perclos)
+        self.events_win = deque()       # (ts, 'blink'|'yawn')
+        self.perclos_win = deque()      # (ts, closed_ms, elapsed_ms)
+        self.perclos_win_closed = 0.0
+        self.perclos_win_elapsed = 0.0
+
+        # buffers por intervalo
+        self.interval_idx = 0
+        self.int_closed_ms = 0.0
+        self.int_elapsed_ms = 0.0
+        self.int_blinks = 0
+        self.int_yawns  = 0
+        self.int_ear_sum = 0.0; self.int_ear_cnt = 0
+        self.int_mar_sum = 0.0; self.int_mar_cnt = 0
+        self.int_states = []
+
+        # histéresis apertura
+        self.open_thr = EAR_THR_CLOSE * (1.0 + EAR_HYST)
+
+    def close(self):
+        try: self.fout.close()
+        except: pass
+        try: self.fsec.close()
+        except: pass
+
+    def _blinks_per_min(self):
+        return sum(1 for _,e in self.events_win if e=='blink') * (60.0 / RATES_WINDOW_S)
+
+    def _yawns_per_min(self):
+        return sum(1 for _,e in self.events_win if e=='yawn') * (60.0 / RATES_WINDOW_S)
+
+    def _perclos_prop_win(self):
+        return (self.perclos_win_closed / self.perclos_win_elapsed) if self.perclos_win_elapsed > 0 else 0.0
+
+    def _flush_interval_if_needed(self, idx, perclos_prop_win):
+        if ((idx + 1) % self.FRAMES_PER_INT) != 0:
+            return
+        avg_ear = (self.int_ear_sum / self.int_ear_cnt) if self.int_ear_cnt > 0 else ""
+        avg_mar = (self.int_mar_sum / self.int_mar_cnt) if self.int_mar_cnt > 0 else ""
+        # estado por intervalo → moda de estados por frame (consistente con tu validación)
+        mode_estado = Counter(self.int_states).most_common(1)[0][0] if self.int_states else "NORMAL"
+        self.wint.writerow([
+            int(self.interval_idx * (self.FRAMES_PER_INT / self.fps_nom)),
+            f"{(self.int_closed_ms / max(1.0, self.int_elapsed_ms)):.3f}",
+            self.int_blinks,
+            self.int_yawns,
+            f"{avg_ear:.4f}" if avg_ear != "" else "",
+            f"{avg_mar:.4f}" if avg_mar != "" else "",
+            mode_estado
+        ])
+        # reset
+        self.interval_idx += 1
+        self.int_closed_ms = 0.0; self.int_elapsed_ms = 0.0
+        self.int_blinks = 0; self.int_yawns = 0
+        self.int_ear_sum = 0.0; self.int_ear_cnt = 0
+        self.int_mar_sum = 0.0; self.int_mar_cnt = 0
+        self.int_states = []
+
+    def run(self):
+        while True:
+            item = self.q_in.get()
+            if item is None:
+                break
+            idx, ts, has_face, ear, mar = item
+            t_start = time.perf_counter()
+
+            blink_event = 0; yawn_event = 0
+
+            # --- Integración por frame ---
+            if has_face and ear is not None:
+                # histéresis de cerrado/abierto
+                if self.eye_closed:
+                    self.eye_closed = 0 if ear >= self.open_thr else 1
+                else:
+                    self.eye_closed = 1 if ear < EAR_THR_CLOSE else 0
+            else:
+                # sin cara: mantener abierto (no contar)
+                self.eye_closed = 0
+                ear = "" if ear is None else ear
+                mar = "" if mar is None else mar
+
+            if self.eye_closed:
+                self.closed_run_ms += self.dt_ms
+                self.int_closed_ms += self.dt_ms
+            else:
+                if self.eye_closed_prev and (BLINK_MIN_MS <= self.closed_run_ms <= BLINK_MAX_MS):
+                    self.blinks_acc += 1
+                    blink_event = 1
+                    self.int_blinks += 1
+                    self.events_win.append((ts, 'blink'))
+                self.closed_run_ms = 0.0
+            self.eye_closed_prev = self.eye_closed
+
+            if mar != "" and mar is not None and mar > 0.65:
+                self.yawn_open_ms += self.dt_ms
+            else:
+                if self.yawn_open_ms >= YAWN_MIN_MS:
+                    self.yawns_acc += 1
+                    yawn_event = 1
+                    self.int_yawns += 1
+                    self.events_win.append((ts, 'yawn'))
+                self.yawn_open_ms = 0.0
+
+            # purga eventos viejos (60s)
+            limit_ev = ts - RATES_WINDOW_S
+            while self.events_win and self.events_win[0][0] < limit_ev:
+                self.events_win.popleft()
+
+            # ventana PERCLOS 60s por frame
+            closed_ms_this = self.dt_ms if self.eye_closed else 0.0
+            self.perclos_win.append((ts, closed_ms_this, self.dt_ms))
+            self.perclos_win_closed  += closed_ms_this
+            self.perclos_win_elapsed += self.dt_ms
+            limit_pc = ts - RATES_WINDOW_S
+            while self.perclos_win and self.perclos_win[0][0] < limit_pc:
+                _, c_ms, e_ms = self.perclos_win.popleft()
+                self.perclos_win_closed  -= c_ms
+                self.perclos_win_elapsed -= e_ms
+            perclos_prop_win = self._perclos_prop_win()
+            perclos_pct_win = perclos_prop_win * 100.0
+
+            bl_pm = self._blinks_per_min()
+            yw_pm = self._yawns_per_min()
+
+            # Estado por frame (fusión): prioridad microsueño por cierre actual; luego EAR_BANDS + tasas
+            st_rates = estado_from_rates(perclos_pct_win, bl_pm, yw_pm, self.closed_run_ms)
+            st_ear   = estado_from_ear_bands(ear if isinstance(ear, float) else None)
+            estado_pf = fuse_states(st_rates, st_ear)
+
+            # CSV per frame
+            def f(x, nd=4): return "" if (x=="" or x is None) else f"{x:.{nd}f}"
+            self.wframe.writerow([
+                idx, f"{ts:.3f}",
+                f(ear), f(mar),
+                1 if self.eye_closed else 0,
+                blink_event, yawn_event,
+                self.blinks_acc, self.yawns_acc,
+                f"{self.closed_run_ms:.1f}",
+                f"{bl_pm:.2f}", f"{yw_pm:.2f}",
+                estado_pf
+            ])
+
+            # acumular al intervalo
+            self.int_elapsed_ms += self.dt_ms
+            if isinstance(ear, float):
+                self.int_ear_sum += ear; self.int_ear_cnt += 1
+            if isinstance(mar, float):
+                self.int_mar_sum += mar; self.int_mar_cnt += 1
+            self.int_states.append(estado_pf)
+
+            # cerrar intervalo si toca
+            self._flush_interval_if_needed(idx, perclos_prop_win)
+
+            # performance por frame
+            t_end = time.perf_counter()
+            self.perf["frame_times_ms"].append((t_end - t_start) * 1000.0)
+
+            # muestreo CPU/RAM ~1/s
+            if self.perf["psutil_proc"] and (idx % int(max(1, round(self.fps_nom)))) == 0:
+                try:
+                    self.perf["cpu_samples"].append(self.perf["psutil_proc"].cpu_percent(interval=None))
+                    self.perf["rss_samples"].append(self.perf["psutil_proc"].memory_info().rss / (1024*1024))
+                except Exception:
+                    pass
+
+        # fin
+        self.close()
+
+# -----------------------------
+# Procesar UN video (multihilo)
+# -----------------------------
+def analyze_video_mt(video_path: str, out_dir: str, agg_interval_s: int = 2):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    out_csv_frame = os.path.join(out_dir, f"{base}_per_frame.csv")
+    out_csv_int   = os.path.join(out_dir, f"{base}_per_{agg_interval_s}s.csv")
+    out_perf_json = os.path.join(out_dir, f"{base}_perf_summary.json")
+    out_perf_csv  = os.path.join(out_dir, f"{base}_perf_summary.csv")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    detector = build_detector(MODEL_PATH, num_threads=4)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ No se pudo abrir: {video_path}")
+        detector.close()
+        return
+
+    fps_nom = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps_nom = max(10.0, min(120.0, fps_nom))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 640)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+    total_frames_nom = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    print(f"\n🎥 {os.path.basename(video_path)} | FPS_nom={fps_nom:.2f} | {W}x{H} | Frames_nom={total_frames_nom or 'desconocido'}")
+
+    # Perf tracker
+    perf = {
+        "t0": time.perf_counter(),
+        "frame_times_ms": [],
+        "cpu_samples": [],
+        "rss_samples": [],
+        "psutil_proc": psutil.Process(os.getpid()) if psutil else None,
+        "fps_nom": fps_nom, "W": W, "H": H
+    }
+    if perf["psutil_proc"]:
+        _ = perf["psutil_proc"].cpu_percent(interval=None)  # priming
+
+    # Colas
+    q_frames = queue.Queue(maxsize=8)
+    q_results = queue.Queue(maxsize=8)
+
+    # Hilos
+    reader = Reader(cap, fps_nom, q_frames)
+    infer  = Inference(detector, W, H, q_frames, q_results)
+    writer = MetricsWriter(fps_nom, agg_interval_s, out_csv_frame, out_csv_int, perf, q_results)
+
+    # Lanzar
+    reader.start(); infer.start(); writer.start()
+
+    # Esperar
+    reader.join()
+    infer.join()
+    q_results.put(None)  # asegurar cierre del writer
+    writer.join()
+
+    # Cerrar recursos
+    cap.release()
+    detector.close()
+
+    # ---- Resumen de rendimiento ----
+    t1 = time.perf_counter()
+    elapsed_s = t1 - perf["t0"]
+    frames_done = len(perf["frame_times_ms"])
+    eff_fps = frames_done / elapsed_s if elapsed_s > 0 else 0.0
+
+    if perf["frame_times_ms"]:
+        avg_ms = sum(perf["frame_times_ms"])/frames_done
+        med_ms = statistics.median(perf["frame_times_ms"])
+        p90_ms = float(np.percentile(perf["frame_times_ms"], 90))
+        max_ms = max(perf["frame_times_ms"])
+    else:
+        avg_ms = med_ms = p90_ms = max_ms = 0.0
+
+    cpu_pct_avg = float(np.mean(perf["cpu_samples"])) if perf["cpu_samples"] else None
+    rss_mb_avg  = float(np.mean(perf["rss_samples"])) if perf["rss_samples"] else None
+    cpu_temp_c  = read_cpu_temp_c()
+
+    summary = {
+        "video": os.path.basename(video_path),
+        "frames_processed": frames_done,
+        "wall_time_s": round(elapsed_s, 3),
+        "effective_fps": round(eff_fps, 2),
+        "frame_ms_avg": round(avg_ms, 2),
+        "frame_ms_median": round(med_ms, 2),
+        "frame_ms_p90": round(p90_ms, 2),
+        "frame_ms_max": round(max_ms, 2),
+        "cpu_percent_avg": round(cpu_pct_avg, 1) if cpu_pct_avg is not None else None,
+        "rss_memory_mb_avg": round(rss_mb_avg, 1) if rss_mb_avg is not None else None,
+        "cpu_temp_c": cpu_temp_c,
+        "threads_used": threading.active_count(),
+        "fps_nominal_from_file": round(perf["fps_nom"], 2),
+        "width": perf["W"],
+        "height": perf["H"]
+    }
+
+    with open(out_perf_json, "w", encoding="utf-8") as jf:
+        json.dump(summary, jf, ensure_ascii=False, indent=2)
+
+    with open(out_perf_csv, "w", newline="", encoding="utf-8") as cf:
+        cw = csv.writer(cf)
+        cw.writerow(list(summary.keys()))
+        cw.writerow(list(summary.values()))
+
+    print(f"✅ Guardado:\n - {out_csv_frame}\n - {out_csv_int}\n - {out_perf_json}\n - {out_perf_csv}")
+
+# -----------------------------
+# BATCH (procesa carpeta)
+# -----------------------------
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    videos = discover_videos(INPUT_DIR, EXTS, recursive=True)
+    print(f"🔎 Encontrados {len(videos)} videos en {INPUT_DIR}")
+
+    for i, vp in enumerate(videos, 1):
+        print(f"\n({i}/{len(videos)}) {vp}")
+        try:
+            analyze_video_mt(vp, OUT_DIR, agg_interval_s=AGG_INTERVAL_S)
+        except Exception as e:
+            print(f"⚠️ Error procesando {vp}: {e}")
+
+if __name__ == "__main__":
+    main()

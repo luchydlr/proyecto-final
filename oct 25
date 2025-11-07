@@ -25,9 +25,9 @@ from paho.mqtt import client as mqtt
 CAM_SIZE = (640, 480)
 
 # Ventana temporal para métricas “por ventana”
-FRAMES_INTERVAL      = 30          # nº frames por ventana de salida (igual que tu versión)
-FATIGA_PERCLOS       = 40.0        # %
-SOMNO_MIN_PERCLOS    = 60.0        # %
+FRAMES_INTERVAL      = 1800         # nº frames por ventana de salida (igual que tu versión)
+FATIGA_PERCLOS       = 30.0        # %
+SOMNO_MIN_PERCLOS    = 40.0        # %
 MICROSLEEP_FRAMES    = 15          # racha de frames cerrados para flag de microsueño (visual)
 
 # ---- PERCLOS ROBUSTO (nuevo) ----
@@ -301,7 +301,7 @@ class InferenceWorker(threading.Thread):
         if self.microsleep_flag:
             return "MICROSUEÑO"
         candidatos = [
-            self._estado_por_blink_rate(blink_rate),
+            #self._estado_por_blink_rate(blink_rate),
             self._estado_por_yawn_rate(yawn_rate),
             self._estado_por_perclos(perclos_pct)
         ]
@@ -310,6 +310,7 @@ class InferenceWorker(threading.Thread):
 
     # ---------- Ventana por FRAMES_INTERVAL (igual que antes) ----------
     def _ventana_cerrar(self):
+        print("Cerrando ventana…")
         now = time.time()
         elapsed = max(now - self.window_start_ts, 1e-3)  # s reales de la ventana
 
@@ -329,18 +330,20 @@ class InferenceWorker(threading.Thread):
         ])
 
         # MQTT (solo si alerta)
-        if estado_final != "NORMAL":
-            payload = {
-                "device_id": CLIENT_ID,
-                "estado": estado_final,
-                "perclos": round(perclos_pct, 2),
-                "blink_rate": round(blink_rate, 2),
-                "yawn_rate": round(yawn_rate, 2),
-                "blinks": int(self.blink_count_win),
-                "yawns": int(self.yawn_count_win),
-                "ts": int(now)
-            }
-            self._publish(payload, qos=1)
+        print(f"Ventana: Estado={estado_final}, PERCLOS={perclos_pct:.2f}%, BlinkRate={blink_rate:.2f}/min, YawnRate={yawn_rate:.2f}/min")  
+         #if estado_final != "NORMAL":
+        print("Enviando alerta MQTT…")
+        payload = {
+            "device_id": CLIENT_ID,
+            "estado": estado_final,
+            "perclos": round(perclos_pct, 2),
+            "blink_rate": round(blink_rate, 2),
+            "yawn_rate": round(yawn_rate, 2),
+            "blinks": int(self.blink_count_win),
+            "yawns": int(self.yawn_count_win),
+            "ts": int(now)
+        }
+        self._publish(payload, qos=1)
 
         # Reset ventana
         self.frames_cnt = 0
@@ -444,6 +447,20 @@ class InferenceWorker(threading.Thread):
                     if self.closed_streak >= MICROSLEEP_FRAMES:
                         self.microsleep_flag = True
                         state_overlay = "MICROSUEÑO"
+                        now = time.time()
+                        print("Enviando alerta MQTT POR MICROSUEÑO…")
+                        payload = {
+                            "device_id": CLIENT_ID,
+                            "estado": state_overlay,
+                            "perclos": round(perclos_pct, 2),
+                            "blink_rate": 0,
+                            "yawn_rate": 0,
+                            "blinks": int(self.blink_count_win),
+                            "yawns": int(self.yawn_count_win),
+                            "ts": int(now)
+                        }
+                        self._publish(payload, qos=1)
+
 
                     if self.frames_cnt >= FRAMES_INTERVAL:
                         self._ventana_cerrar()
@@ -490,6 +507,7 @@ class InferenceWorker(threading.Thread):
                 pass
             try:
                 if self.mqtt_client:
+                    print("🔌 Desconectando MQTT…")
                     self.mqtt_client.loop_stop()
                     self.mqtt_client.disconnect()
             except Exception:
