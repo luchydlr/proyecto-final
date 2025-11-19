@@ -1,0 +1,17 @@
+{
+  "video": "026_nightglasses_mix.mp4",
+  "frames_processed": 2851,
+  "wall_time_s": 75.89,
+  "effective_fps": 37.57,
+  "frame_ms_avg": 0.08,
+  "frame_ms_median": 0.06,
+  "frame_ms_p90": 0.1,
+  "frame_ms_max": 2.16,
+  "cpu_percent_avg": 116.4,
+  "rss_memory_mb_avg": 193.3,
+  "cpu_temp_c": 71.4,
+  "threads_used": 1,
+  "fps_nominal_from_file": 29.97,
+  "width": 640,
+  "height": 480
+}

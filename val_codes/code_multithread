@@ -25,8 +25,8 @@ from mediapipe.tasks.python import vision
 # RUTAS / CONFIG (tus valores)
 # -----------------------------
 MODEL_PATH   = "/home/lucianadelarosa/Desktop/proyecto-final/facemesh/face_landmarker.task"
-INPUT_DIR    = "/home/lucianadelarosa/Desktop/UTA-RLDD/01"
-OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_multi/UTA-RLDD/01"
+INPUT_DIR    = "/home/lucianadelarosa/Desktop/NTHU/030"
+OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_multi/NTHU/030"
 EXTS         = (".mp4", ".mov", ".avi", ".mkv", ".MOV")
 
 # Tamaño de intervalo para CSV agregado (debe coincidir con tus anotaciones)

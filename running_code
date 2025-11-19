@@ -28,7 +28,7 @@ CAM_SIZE = (640, 480)
 FRAMES_INTERVAL      = 1800         # nº frames por ventana de salida (igual que tu versión)
 FATIGA_PERCLOS       = 30.0        # %
 SOMNO_MIN_PERCLOS    = 40.0        # %
-MICROSLEEP_FRAMES    = 15          # racha de frames cerrados para flag de microsueño (visual)
+MICROSLEEP_FRAMES    = 30          # racha de frames cerrados para flag de microsueño (visual)
 
 # ---- PERCLOS ROBUSTO (nuevo) ----
 PERCLOS_WINDOW_S     = 60.0        # segundos de ventana deslizante
@@ -216,6 +216,14 @@ class InferenceWorker(threading.Thread):
             self.mqtt_client.connect(ENDPOINT, PORT, keepalive=60)
             self.mqtt_client.loop_start()
             print("🔗 MQTT (AWS IoT) inicializado.")
+          # ---- Envío de estado inicial ----
+            print("Enviando estado inicial MQTT: INICIANDO…")
+            payload_init = {
+               "device_id": CLIENT_ID,
+               "estado": "INICIANDO"
+        }
+            self._publish(payload_init, qos=1)
+
         except Exception as e:
             import traceback
             print(f"⚠️ No se pudo conectar a MQTT: {e}")

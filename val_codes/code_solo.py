@@ -1,137 +1,98 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Batch por videos (RPi ready) — SOLO EAR decide el Estado (conserva Microsueño por racha cerrada)
-Genera por video:
-  - base_per_frame.csv  (EAR, MAR, EyeClosed, Blink/Yawn events, tasas/min, ClosedRun_ms, Estado)
-  - base_per_{AGG_INTERVAL_S}s.csv  (Start_s, PERCLOS, Blinks, Yawns, Avg_EAR, Avg_MAR, Mode_Estado)
-  - base_perf_summary.json / .csv (CPU %, RAM, temp, FPS, etc. si disponibles)
-
-Dependencias sugeridas:
-  sudo apt-get update && sudo apt-get install -y python3-opencv
-  pip install mediapipe tqdm psutil numpy
-"""
-
-import os, glob, csv, math, collections, json, time, statistics, shutil, subprocess, threading
-import numpy as np
+import os, glob, csv, math, time, collections, statistics, shutil, subprocess, json
 import cv2
-from tqdm import tqdm
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
-# psutil opcional (para CPU/RAM). Si no está, seguimos sin esas métricas.
 try:
     import psutil
 except Exception:
     psutil = None
 
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
-
-# -----------------------------
-# RUTAS / CONFIG (EDITA A TU GUSTO)
-# -----------------------------
+# ========= RUTAS / CONFIG =========
 MODEL_PATH   = "/home/lucianadelarosa/Desktop/proyecto-final/facemesh/face_landmarker.task"
-INPUT_DIR    = "/home/lucianadelarosa/Desktop/UTA-RLDD/01"
-OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_solo/UTA-RLDD/01"
+INPUT_DIR    = "/home/lucianadelarosa/Desktop/NTHU/030"
+OUT_DIR      = "/home/lucianadelarosa/Desktop/proyecto-final/val-annot/code_solo/NTHU/030"
 EXTS         = (".mp4", ".mov", ".avi", ".mkv", ".MOV")
 RECURSIVE    = False
 SKIP_IF_EXISTS = False
 
-# Agregación temporal para el CSV por ventanas
-AGG_INTERVAL_S = 2
+# ========= UMBRALES =========
+EAR_THR = 0.21                  # ojo cerrado si EAR < EAR_THR
+MIN_BLINK_CLOSED_FRAMES = 2     # frames cerrados mínimos para contar parpadeo
+YAWN_MAR_THR = 0.65             # umbral MAR para bostezo
+YAWN_HOLD_FRAMES = 5            # frames consecutivos por encima para activar yawn
+MICRO_SECONDS = 1.5             # duración para MICROSUEÑO (segundos)
+RATES_WINDOW_S = 60.0           # ventana para tasas por minuto
 
-# Ventana para tasas/min y PERCLOS (fijo, NO adaptativo)
-RATES_WINDOW_S = 60.0
-
-# -----------------------------
-# UMBRALES / TIEMPOS (ms)
-# -----------------------------
-# EAR clásico con histéresis (abre/cierra)
-EYE_THR_CLOSE = 0.21   # EAR por debajo → cerrado
-EYE_THR_OPEN  = 0.25   # EAR por encima → abierto
-
-BLINK_MIN_MS  = 60     # duración mínima de cierre para contar blink
-BLINK_MAX_MS  = 500
-YAWN_MIN_MS   = 1000
-MICRO_MS      = 1500   # ≥ 1.5 s de cierre continuo = Microsueño
-YAWN_THR      = 0.65   # umbral MAR para activar conteo de bostezo
-
-# -----------------------------
-# EAR_BANDS (tabla fija para decisión por EAR)
-# -----------------------------
+# Bandas por EAR (idéntico a Colab)
 EAR_BANDS = {
-    "NORMAL":      (0.25, 1.00),
-    "FATIGA":      (0.21, 0.25),
-    "SOMNOLENCIA": (0.15, 0.21),
-    "MICROSUEÑO":  (0.00, 0.15),
+    "NORMAL":      (0.25,  10.0),  # 10.0 para cubrir valores altos
+    "FATIGA":      (0.21,  0.25),
+    "SOMNOLENCIA": (0.00,  0.21),
 }
+
+# Ranking de severidad
 RANK = {"NORMAL": 0, "FATIGA": 1, "SOMNOLENCIA": 2, "MICROSUEÑO": 3}
 
-# -----------------------------
-# Tabla Blinks/Yawns por minuto (solo diagnóstico; no decide Estado)
-# -----------------------------
-def estado_by_blinks_yawns(blinks_pm, yawns_pm):
-    # Normal
-    if (17 <= blinks_pm <= 25) and (yawns_pm <= 1):
-        return "NORMAL"
-    # Fatiga
-    if (12 <= blinks_pm <= 16) and (1 <= yawns_pm <= 4):
-        return "FATIGA"
-    # Somnolencia
-    if (6 <= blinks_pm <= 12) and (yawns_pm > 4):
-        return "SOMNOLENCIA"
-    # fallback suave según blinks
-    if blinks_pm < 6:
-        return "SOMNOLENCIA"
-    if blinks_pm <= 12:
-        return "FATIGA"
-    return "NORMAL"
-
-# -----------------------------
-# Landmarks (FaceMesh)
-# -----------------------------
-LEFT_EYE_IDX  = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
+# ========= LANDMARKS (MediaPipe FaceMesh) =========
+RIGHT_EYE_IDX = [33, 160, 158, 133, 153, 144]
+LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
 MOUTH_VERT_PAIRS = [(13,14), (82,87), (312,317)]
 MOUTH_HORZ = (78, 308)
 
-# -----------------------------
-# Utilidades geométricas
-# -----------------------------
+# ========= UTILIDADES =========
 def hypot2(x1, y1, x2, y2):
     return math.hypot(x1 - x2, y1 - y2)
 
-def aspect_ratio_6(lms, idxs, w, h):
-    """EAR clásico: (|p2-p6| + |p3-p5|) / (2*|p1-p4|)"""
+# EAR idéntico a Colab (por ojo)
+def ear_one_eye(lms, idxs, w, h):
     try:
-        p = [(lms[i].x * w, lms[i].y * h) for i in idxs[:6]]
-        (x1,y1),(x2,y2),(x3,y3),(x4,y4),(x5,y5),(x6,y6) = p
-        v1 = hypot2(x2,y2,x6,y6)
-        v2 = hypot2(x3,y3,x5,y5)
-        h1 = hypot2(x1,y1,x4,y4)
-        return (v1 + v2) / (2.0 * h1) if h1 > 0 else None
+        (x1,y1) = (lms[idxs[0]].x * w, lms[idxs[0]].y * h)
+        (x2,y2) = (lms[idxs[1]].x * w, lms[idxs[1]].y * h)
+        (x3,y3) = (lms[idxs[2]].x * w, lms[idxs[2]].y * h)
+        (x4,y4) = (lms[idxs[3]].x * w, lms[idxs[3]].y * h)
+        (x5,y5) = (lms[idxs[4]].x * w, lms[idxs[4]].y * h)
+        (x6,y6) = (lms[idxs[5]].x * w, lms[idxs[5]].y * h)
+        v1 = hypot2(x2, y2, x6, y6)
+        v2 = hypot2(x3, y3, x5, y5)
+        h1 = hypot2(x1, y1, x4, y4)
+        if h1 == 0:
+            return None
+        return (v1 + v2) / (2.0 * h1)
     except Exception:
         return None
 
-def mouth_aspect_ratio_robust(lms, w, h):
-    """MAR robusto: promedio 3 verticales / horizontal 78–308, con clamp suave."""
+def avg_ear(lms, w, h):
+    er = ear_one_eye(lms, RIGHT_EYE_IDX, w, h)
+    el = ear_one_eye(lms, LEFT_EYE_IDX,  w, h)
+    if er is None or el is None:
+        return None
+    return (er + el) / 2.0
+
+# MAR idéntico a Colab
+def mar_value(lms, w, h):
     try:
-        vds = []
-        for a,b in MOUTH_VERT_PAIRS:
-            ta = (lms[a].x*w, lms[a].y*h); tb = (lms[b].x*w, lms[b].y*h)
-            vds.append(hypot2(ta[0], ta[1], tb[0], tb[1]))
-        left = (lms[MOUTH_HORZ[0]].x*w, lms[MOUTH_HORZ[0]].y*h)
-        righ = (lms[MOUTH_HORZ[1]].x*w, lms[MOUTH_HORZ[1]].y*h)
-        hd = hypot2(left[0], left[1], righ[0], righ[1])
-        if hd <= 0:
+        left  = (lms[MOUTH_HORZ[0]].x * w, lms[MOUTH_HORZ[0]].y * h)
+        right = (lms[MOUTH_HORZ[1]].x * w, lms[MOUTH_HORZ[1]].y * h)
+        mouth_w = hypot2(left[0], left[1], right[0], right[1])
+        if mouth_w == 0:
             return None
-        mar = float(np.mean(vds)) / hd
-        if not (0.10 <= mar <= 1.20):
-            return None
+        v_dists = []
+        for a, b in MOUTH_VERT_PAIRS:
+            A = (lms[a].x * w, lms[a].y * h)
+            B = (lms[b].x * w, lms[b].y * h)
+            v_dists.append(hypot2(A[0], A[1], B[0], B[1]))
+        mar = (sum(v_dists) / len(v_dists)) / mouth_w
         return mar
     except Exception:
         return None
+
+def discover_videos(folder: str, exts=EXTS, recursive=False):
+    pattern = "**/*" if recursive else "*"
+    paths = [p for p in glob.glob(os.path.join(folder, pattern), recursive=recursive)
+             if os.path.splitext(p)[1].lower() in tuple(e.lower() for e in exts)]
+    return sorted(paths)
 
 def safe_open_csv(path, header):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -140,25 +101,57 @@ def safe_open_csv(path, header):
     w.writerow(header)
     return f, w
 
-def discover_videos(folder: str, exts=EXTS, recursive=False):
-    pattern = "**/*" if recursive else "*"
-    paths = [p for p in glob.glob(os.path.join(folder, pattern), recursive=recursive)
-             if os.path.splitext(p)[1].lower() in tuple(e.lower() for e in exts)]
-    return sorted(paths)
-
-# -----------------------------
-# Detector
-# -----------------------------
-def build_detector(model_path: str, num_threads: int = 4):
-    """Crea FaceLandmarker con compatibilidad de versiones para num_threads."""
+# ========= Health check MediaPipe =========
+def rpi_vcgencmd(args):
     try:
-        base_options = mp_python.BaseOptions(
-            model_asset_path=model_path,
-            num_threads=num_threads
-        )
+        if shutil.which("vcgencmd"):
+            out = subprocess.check_output(["vcgencmd"] + args, timeout=1.0).decode("utf-8").strip()
+            return out
+    except Exception:
+        pass
+    return None
+
+def read_cpu_temp_c():
+    """Raspberry Pi: vcgencmd measure_temp → float en °C, o None."""
+    out = rpi_vcgencmd(["measure_temp"])
+    if not out:
+        return None
+    try:
+        # ejemplo: 'temp=48.2'C'
+        val = out.split("=")[1].split("'")[0]
+        return float(val)
+    except Exception:
+        return None
+
+def read_rpi_gpu_info():
+    """Devuelve (gpu_clock_hz, gpu_mem_mb, arm_mem_mb) si vcgencmd está; de lo contrario None."""
+    clk = rpi_vcgencmd(["measure_clock", "v3d"])  # GPU 3D clock
+    mem_gpu = rpi_vcgencmd(["get_mem", "gpu"])
+    mem_arm = rpi_vcgencmd(["get_mem", "arm"])
+    def parse_clock(s):
+        try:
+            # 'frequency(46)=500000000' → 500000000
+            return int(s.split("=")[1])
+        except Exception:
+            return None
+    def parse_mem_mb(s):
+        try:
+            # 'gpu=76M' / 'arm=948M' → 76 / 948
+            return int(''.join(ch for ch in s if ch.isdigit()))
+        except Exception:
+            return None
+    return (
+        parse_clock(clk) if clk else None,
+        parse_mem_mb(mem_gpu) if mem_gpu else None,
+        parse_mem_mb(mem_arm) if mem_arm else None,
+    )
+
+# ========= MediaPipe Tasks Detector =========
+def build_detector(model_path: str, num_threads: int = 4):
+    try:
+        base_options = mp_python.BaseOptions(model_asset_path=model_path, num_threads=num_threads)
     except TypeError:
         base_options = mp_python.BaseOptions(model_asset_path=model_path)
-
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         output_face_blendshapes=False,
@@ -170,67 +163,73 @@ def build_detector(model_path: str, num_threads: int = 4):
     )
     return vision.FaceLandmarker.create_from_options(options)
 
-# -----------------------------
-# Métricas de sistema (opcionales)
-# -----------------------------
-def read_cpu_temp_c():
-    """Intenta leer temperatura CPU en Raspberry Pi via vcgencmd."""
-    try:
-        if shutil.which("vcgencmd"):
-            out = subprocess.check_output(["vcgencmd", "measure_temp"]).decode("utf-8").strip()
-            # formato: temp=48.2'C
-            val = out.split("=")[1].split("'")[0]
-            return float(val)
-    except Exception:
-        pass
-    return None
-
-# -----------------------------
-# Helpers de estado
-# -----------------------------
-def estado_by_perclos(perclos_pct):
-    """Referencial (no se usa para decidir Estado en esta versión SOLO EAR)."""
-    if perclos_pct >= 80:
-        return "MICROSUEÑO"
-    if perclos_pct >= 60:
-        return "SOMNOLENCIA"
-    if perclos_pct >= 40:
-        return "FATIGA"
-    return "NORMAL"
-
+# ========= Clasificadores por variable =========
 def estado_by_ear(ear):
     if ear is None:
         return "NORMAL"
-    for cls, (lo, hi) in EAR_BANDS.items():
+    for nombre, (lo, hi) in EAR_BANDS.items():
         if lo <= ear < hi:
-            return cls
+            return nombre
     return "NORMAL"
 
-def fuse_states(*candidatos):
-    """Si en algún momento quisieras fusionar; aquí queda por compatibilidad."""
-    best = "NORMAL"; best_r = -1
-    for c in candidatos:
-        r = RANK.get(c, 0)
-        if r > best_r:
-            best = c; best_r = r
-    return best
+def estado_by_blinks(blinks_pm: float):
+    if blinks_pm is None:
+        return "NORMAL"
+    if 17 <= blinks_pm <= 25:
+        return "NORMAL"
+    if 12 <= blinks_pm <= 16:
+        return "FATIGA"
+    if 6  <= blinks_pm <= 12:
+        return "SOMNOLENCIA"
+    if blinks_pm < 6:
+        return "SOMNOLENCIA"
+    # >25: a menudo conversación/ruido; mantenemos NORMAL (ajusta si prefieres)
+    return "NORMAL"
 
-# -----------------------------
-# Procesar UN video
-# -----------------------------
-def analyze_video(video_path: str, out_dir: str, agg_interval_s: int = 2):
+def estado_by_yawns(yawns_pm: float):
+    if yawns_pm is None:
+        return "NORMAL"
+    if yawns_pm <= 1:
+        return "NORMAL"
+    if 1 < yawns_pm <= 4:
+        return "FATIGA"
+    return "SOMNOLENCIA"
+
+# ========= Decisor (EAR principal; secundarios suben severidad por consenso) =========
+def decidir_estado(ear, closed_run_frames, micro_frames, blinks_pm, yawns_pm):
+    # 0) prioridad absoluta a microsueño por racha
+    if closed_run_frames >= micro_frames:
+        return "MICROSUEÑO"
+
+    # 1) estado base: SOLO EAR
+    base = estado_by_ear(ear)
+    base_rank = RANK[base]
+
+    # 2) secundarios (solo para reforzar si AMBOS coinciden en algo > base)
+    s_b = estado_by_blinks(blinks_pm)
+    s_y = estado_by_yawns(yawns_pm)
+    r_b, r_y = RANK[s_b], RANK[s_y]
+    both_min = min(r_b, r_y)
+
+    if both_min > base_rank:
+        # subir exactamente al nivel mínimo común de los dos secundarios (consenso)
+        for nombre, rank in RANK.items():
+            if rank == both_min:
+                return nombre
+
+    # 3) si no hay consenso superior, se respeta EAR (no se degrada)
+    return base
+
+# ========= Procesamiento de un video =========
+def process_video_csv_colab(video_path: str, out_dir: str):
     base = os.path.splitext(os.path.basename(video_path))[0]
-    out_csv_frame = os.path.join(out_dir, f"{base}_per_frame.csv")
-    out_csv_int   = os.path.join(out_dir, f"{base}_per_{agg_interval_s}s.csv")
-    out_perf_json = os.path.join(out_dir, f"{base}_perf_summary.json")
-    out_perf_csv  = os.path.join(out_dir, f"{base}_perf_summary.csv")
-
-    if SKIP_IF_EXISTS and os.path.exists(out_csv_frame) and os.path.exists(out_csv_int):
-        print(f"⏭️  Ya existe salida para '{base}', omitiendo.")
+    out_csv = os.path.join(out_dir, f"{base}_val.csv")
+    out_health = os.path.join(out_dir, f"{base}_health.json")
+    if SKIP_IF_EXISTS and os.path.exists(out_csv):
+        print(f"⏭️  Ya existe: {out_csv}")
         return
 
     os.makedirs(out_dir, exist_ok=True)
-
     detector = build_detector(MODEL_PATH, num_threads=4)
 
     cap = cv2.VideoCapture(video_path)
@@ -239,275 +238,200 @@ def analyze_video(video_path: str, out_dir: str, agg_interval_s: int = 2):
         detector.close()
         return
 
-    fps_nom = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    fps_nom = max(10.0, min(120.0, fps_nom))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = fps if fps and fps > 0 else 30.0
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 640)
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-    total_frames_nom = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    # Estados internos
-    eye_closed = 0
-    eye_closed_prev = 0
-    closed_run_ms = 0.0
-    yawn_open_ms  = 0.0
-    yawns_acc = 0
-    blinks_acc = 0
+    MICRO_FRAMES = int(round(MICRO_SECONDS * fps))
 
-    # Ventanas deslizantes (60 s)
-    events_win = collections.deque()     # (ts, 'blink'|'yawn')
-    perclos_win = collections.deque()    # (ts, closed_ms, elapsed_ms)
-    perclos_win_closed = 0.0
-    perclos_win_elapsed = 0.0
+    f, wr = safe_open_csv(out_csv, [
+        "Frame_ID","time_s","EAR","eye_closed","blink_count","MAR","yawn_active","yawn_count",
+        "estado","blinks_per_min","yawns_per_min"
+    ])
 
-    # Intervalo exacto por frames (para CSV por 2 s)
-    FRAMES_PER_INT = int(round(agg_interval_s * fps_nom))
-    interval_idx = 0
-    int_closed_ms = 0.0
-    int_elapsed_ms = 0.0
-    int_blinks = 0
-    int_yawns  = 0
-    int_ear_sum = 0.0
-    int_ear_cnt = 0
-    int_mar_sum = 0.0
-    int_mar_cnt = 0
-    estados_intervalo = []
+    # estados por frames
+    closed_run = 0
+    blink_count = 0
+    yawn_run = 0
+    yawn_active = False
+    yawn_count = 0
 
-    # CSVs con headers EXACTOS
-    f_frame, wframe = safe_open_csv(
-        out_csv_frame,
-        ["Frame_ID","Timestamp_s","EAR","MAR","EyeClosed","BlinkEvent","YawnEvent",
-         "Blinks_acc","Yawns_acc","Blinks_per_min","Yawns_per_min","ClosedRun_ms","Estado"]
-    )
-    f_int, winter = safe_open_csv(
-        out_csv_int,
-        ["Start_2s","PERCLOS","Blinks","Yawns","Avg_EAR","Avg_MAR","Mode_Estado"]
-    )
-
-    print(f"\n🎥 {os.path.basename(video_path)} | FPS_nom={fps_nom:.2f} | {W}x{H} | Frames_nom={total_frames_nom or 'desconocido'}")
-
-    idx = 0
-    dt_ms = 1000.0 / fps_nom
-
-    # PERF MON
-    frame_times = []
+    # ventana deslizante para tasas/min (timestamp en segundos)
+    events_win = collections.deque()  # (ts, 'blink'|'yawn')
+    
+    # -------- Health / performance trackers --------
     t0 = time.perf_counter()
+    frame_times_ms = []
+
+    # psutil sampling (opcional)
     if psutil:
         proc = psutil.Process(os.getpid())
+        _ = proc.cpu_percent(interval=None)  # prime
         cpu_samples = []
         rss_samples = []
-        _ = proc.cpu_percent(interval=None)
     else:
         proc = None
+        cpu_samples = []
+        rss_samples = []
+
+    # tomar una lectura GPU/mem al inicio (mejor esfuerzo RPi)
+    gpu_clock_hz, gpu_mem_mb, arm_mem_mb = read_rpi_gpu_info()
+
+    frame_idx = 0
+    print(f"🎥 {os.path.basename(video_path)} | FPS={fps:.2f} | {W}x{H} | micro_frames={MICRO_FRAMES}")
 
     try:
-        with tqdm(total=(total_frames_nom if total_frames_nom>0 else None), unit="f", dynamic_ncols=True) as pbar:
-            while True:
-                t_frame_start = time.perf_counter()
+        while True:
+            t_frame_start = time.perf_counter()
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
 
-                ok, frame_bgr = cap.read()
-                if not ok:
-                    break
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+            res = detector.detect(mp_img)
 
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-                res = detector.detect(mp_img)
+            ear = None
+            mar = None
+            eye_closed_flag = 0
 
-                ts = idx / fps_nom
-                ear = None
-                mar = None
-                blink_event = 0
-                yawn_event  = 0
+            if res.face_landmarks:
+                lms = res.face_landmarks[0]
+                ear = avg_ear(lms, W, H)   # PROMEDIO (idéntico a Colab)
+                mar = mar_value(lms, W, H) # MAR (idéntico a Colab)
 
-                if res.face_landmarks:
-                    lms = res.face_landmarks[0]
-                    ear_l = aspect_ratio_6(lms, LEFT_EYE_IDX,  W, H)
-                    ear_r = aspect_ratio_6(lms, RIGHT_EYE_IDX, W, H)
-                    mar   = mouth_aspect_ratio_robust(lms, W, H)
+            # timestamp preferido desde el contenedor; si no, derivado por FPS
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+            ts = (pos_msec / 1000.0) if (pos_msec and pos_msec > 0) else (frame_idx / fps)
 
-                    # limpieza
-                    if ear_l is not None and (ear_l < 0.02 or ear_l > 0.80): ear_l = None
-                    if ear_r is not None and (ear_r < 0.02 or ear_r > 0.80): ear_r = None
+            # --- BLINKS: racha de frames cerrados
+            if ear is not None and ear < EAR_THR:
+                eye_closed_flag = 1
+                closed_run += 1
+            else:
+                if closed_run >= MIN_BLINK_CLOSED_FRAMES:
+                    blink_count += 1
+                    events_win.append((ts, 'blink'))
+                closed_run = 0
+                eye_closed_flag = 0
 
-                    if (ear_l is not None) and (ear_r is not None):
-                        ear = min(ear_l, ear_r)
+            # --- YAWNS: hold de MAR
+            if mar is not None and mar > YAWN_MAR_THR:
+                yawn_run += 1
+                if not yawn_active and yawn_run >= YAWN_HOLD_FRAMES:
+                    yawn_active = True
+            else:
+                if yawn_active:
+                    yawn_count += 1
+                    events_win.append((ts, 'yawn'))
+                yawn_active = False
+                yawn_run = 0
 
-                        # histéresis de cierre
-                        if eye_closed:
-                            eye_closed = 0 if ear >= EYE_THR_OPEN else 1
-                        else:
-                            eye_closed = 1 if ear < EYE_THR_CLOSE else 0
+            # --- Tasas por minuto (ventana 60s)
+            limit_ev = ts - RATES_WINDOW_S
+            while events_win and events_win[0][0] < limit_ev:
+                events_win.popleft()
+            blinks_pm = (sum(1 for t,e in events_win if e=='blink') * 60.0) / RATES_WINDOW_S
+            yawns_pm  = (sum(1 for t,e in events_win if e=='yawn')  * 60.0) / RATES_WINDOW_S
 
-                # ---- Integración temporal por frame
-                if eye_closed:
-                    closed_run_ms += dt_ms
-                    int_closed_ms += dt_ms
-                else:
-                    if eye_closed_prev and (BLINK_MIN_MS <= closed_run_ms <= BLINK_MAX_MS):
-                        blinks_acc += 1
-                        blink_event = 1
-                        int_blinks += 1
-                        events_win.append((ts, 'blink'))
-                    closed_run_ms = 0.0
-                eye_closed_prev = eye_closed
+            # --- Estado final (EAR principal; secundarios refuerzan por consenso)
+            estado = decidir_estado(ear, closed_run, MICRO_FRAMES, blinks_pm, yawns_pm)
 
-                if mar is not None and mar > YAWN_THR:
-                    yawn_open_ms += dt_ms
-                else:
-                    if yawn_open_ms >= YAWN_MIN_MS:
-                        yawns_acc += 1
-                        yawn_event = 1
-                        int_yawns += 1
-                        events_win.append((ts, 'yawn'))
-                    yawn_open_ms = 0.0
+            # --- Escribir CSV
+            wr.writerow([
+                frame_idx,
+                f"{ts:.3f}",
+                "" if ear is None else f"{ear:.5f}",
+                eye_closed_flag,
+                blink_count,
+                "" if mar is None else f"{mar:.5f}",
+                1 if yawn_active else 0,
+                yawn_count,
+                estado,
+                f"{blinks_pm:.2f}",
+                f"{yawns_pm:.2f}"
+            ])
+            
+            # ====== Health sampling ======
+            frame_ms = (time.perf_counter() - t_frame_start) * 1000.0
+            frame_times_ms.append(frame_ms)
+            if psutil and (frame_idx % int(max(1, round(fps)))) == 0:
+                try:
+                    cpu_samples.append(proc.cpu_percent(interval=None))               # %
+                    rss_samples.append(proc.memory_info().rss / (1024*1024))          # MB
+                except Exception:
+                    pass
 
-                # --- Ventanas deslizantes 60 s para tasas y PERCLOS ---
-                # Purga eventos viejos (para tasas por minuto)
-                limit_ev = ts - RATES_WINDOW_S
-                while events_win and events_win[0][0] < limit_ev:
-                    events_win.popleft()
-                blinks_per_min = (sum(1 for t,e in events_win if e=='blink') * 60.0) / RATES_WINDOW_S
-                yawns_per_min  = (sum(1 for t,e in events_win if e=='yawn')  * 60.0) / RATES_WINDOW_S
-
-                # Ventana PERCLOS 60s (proporción de tiempo con ojo cerrado)
-                closed_ms_this = dt_ms if eye_closed else 0.0
-                perclos_win.append((ts, closed_ms_this, dt_ms))
-                perclos_win_closed  += closed_ms_this
-                perclos_win_elapsed += dt_ms
-                limit_pc = ts - RATES_WINDOW_S
-                while perclos_win and perclos_win[0][0] < limit_pc:
-                    _, c_ms, e_ms = perclos_win.popleft()
-                    perclos_win_closed  -= c_ms
-                    perclos_win_elapsed -= e_ms
-                perclos_prop_win = (perclos_win_closed / perclos_win_elapsed) if perclos_win_elapsed > 0 else 0.0
-                perclos_pct_win  = perclos_prop_win * 100.0
-
-                # ====== DECISIÓN DE ESTADO — SOLO EAR (con microsueño por racha) ======
-                if closed_run_ms >= MICRO_MS:
-                    estado = "MICROSUEÑO"
-                else:
-                    estado = estado_by_ear(ear)  # usa exclusivamente EAR_BANDS
-
-                # CSV per-frame (exacto)
-                def f(x, nd=4): return "" if x is None else f"{x:.{nd}f}"
-                wframe.writerow([
-                    idx, f"{ts:.3f}", f(ear), f(mar),
-                    1 if eye_closed else 0, blink_event, yawn_event,
-                    blinks_acc, yawns_acc, f"{blinks_per_min:.2f}", f"{yawns_per_min:.2f}",
-                    f"{closed_run_ms:.1f}", estado
-                ])
-
-                # --- Acumular para el intervalo (CSV de 2s)
-                int_elapsed_ms += dt_ms
-                if ear is not None:
-                    int_ear_sum += ear; int_ear_cnt += 1
-                if mar is not None:
-                    int_mar_sum += mar; int_mar_cnt += 1
-                estados_intervalo.append(estado)
-
-                # ¿cerramos intervalo exacto por frames?
-                if ((idx + 1) % FRAMES_PER_INT) == 0:
-                    perclos_prop_int = (int_closed_ms / max(1.0, int_elapsed_ms))      # 0–1
-                    avg_ear = (int_ear_sum / int_ear_cnt) if int_ear_cnt > 0 else ""
-                    avg_mar = (int_mar_sum / int_mar_cnt) if int_mar_cnt > 0 else ""
-
-                    # moda del estado en el intervalo
-                    if estados_intervalo:
-                        mode_estado = max(set(estados_intervalo), key=estados_intervalo.count)
-                    else:
-                        mode_estado = "NORMAL"
-
-                    start_2s = interval_idx * agg_interval_s
-                    winter.writerow([
-                        start_2s,
-                        f"{perclos_prop_int:.3f}",
-                        int_blinks,
-                        int_yawns,
-                        f"{avg_ear:.4f}" if avg_ear != "" else "",
-                        f"{avg_mar:.4f}" if avg_mar != "" else "",
-                        mode_estado
-                    ])
-
-                    # reset intervalo
-                    interval_idx += 1
-                    int_closed_ms = 0.0
-                    int_elapsed_ms = 0.0
-                    int_blinks = 0
-                    int_yawns  = 0
-                    int_ear_sum = 0.0; int_ear_cnt = 0
-                    int_mar_sum = 0.0; int_mar_cnt = 0
-                    estados_intervalo = []
-
-                # ===== PERF por frame =====
-                frame_ms = (time.perf_counter() - t_frame_start) * 1000.0
-                frame_times.append(frame_ms)
-
-                # muestreo CPU/RAM cada ~1s
-                if psutil and (idx % int(max(1, round(fps_nom)))) == 0:
-                    try:
-                        cpu_samples.append(proc.cpu_percent(interval=None))  # %
-                        rss_samples.append(proc.memory_info().rss / (1024*1024))  # MB
-                    except Exception:
-                        pass
-
-                idx += 1
-                pbar.update(1)
+            frame_idx += 1
 
     finally:
         cap.release()
         detector.close()
-        f_frame.close()
-        f_int.close()
+        f.close()
 
-    # ===== Resumen de rendimiento =====
+    # --------- Build health JSON ---------
     t1 = time.perf_counter()
     elapsed_s = t1 - t0
-    frames_done = len(frame_times)
-    eff_fps = frames_done / elapsed_s if elapsed_s > 0 else 0.0
+    frames_done = len(frame_times_ms)
+    eff_fps = (frames_done / elapsed_s) if elapsed_s > 0 else 0.0
 
-    if frame_times:
-        avg_ms = sum(frame_times)/len(frame_times)
-        med_ms = statistics.median(frame_times)
-        p90_ms = np.percentile(frame_times, 90)
-        max_ms = max(frame_times)
+    if frame_times_ms:
+        avg_ms = sum(frame_times_ms)/frames_done
+        med_ms = statistics.median(frame_times_ms)
+        p90_ms = float(np_percentile(frame_times_ms, 90.0))
+        max_ms = max(frame_times_ms)
     else:
         avg_ms = med_ms = p90_ms = max_ms = 0.0
 
-    cpu_pct_avg = float(np.mean(cpu_samples)) if psutil and cpu_samples else None
-    rss_mb_avg  = float(np.mean(rss_samples)) if psutil and rss_samples else None
-    cpu_temp_c  = read_cpu_temp_c()
+    cpu_pct_avg = float(sum(cpu_samples)/len(cpu_samples)) if cpu_samples else None
+    rss_mb_avg  = float(sum(rss_samples)/len(rss_samples)) if rss_samples else None
+    cpu_temp    = read_cpu_temp_c()
 
-    perf = {
+    health = {
         "video": os.path.basename(video_path),
         "frames_processed": frames_done,
         "wall_time_s": round(elapsed_s, 3),
         "effective_fps": round(eff_fps, 2),
         "frame_ms_avg": round(avg_ms, 2),
         "frame_ms_median": round(med_ms, 2),
-        "frame_ms_p90": round(float(p90_ms), 2),
+        "frame_ms_p90": round(p90_ms, 2),
         "frame_ms_max": round(max_ms, 2),
         "cpu_percent_avg": round(cpu_pct_avg, 1) if cpu_pct_avg is not None else None,
         "rss_memory_mb_avg": round(rss_mb_avg, 1) if rss_mb_avg is not None else None,
-        "cpu_temp_c": cpu_temp_c,
-        "threads_used": threading.active_count(),
-        "fps_nominal_from_file": round(fps_nom, 2),
+        "cpu_temp_c": cpu_temp,
+        # Raspberry Pi extras (mejor esfuerzo, pueden ser None):
+        "rpi_gpu_clock_hz": gpu_clock_hz,
+        "rpi_gpu_mem_mb": gpu_mem_mb,
+        "rpi_arm_mem_mb": arm_mem_mb,
+        # meta del archivo fuente
+        "fps_nominal_from_file": round(fps, 2),
         "width": W,
-        "height": H
+        "height": H,
     }
 
-    # Guardar JSON y CSV
-    with open(out_perf_json, "w", encoding="utf-8") as jf:
-        json.dump(perf, jf, ensure_ascii=False, indent=2)
+    with open(out_health, "w", encoding="utf-8") as jf:
+        json.dump(health, jf, ensure_ascii=False, indent=2)
 
-    with open(out_perf_csv, "w", newline="", encoding="utf-8") as cf:
-        cw = csv.writer(cf)
-        cw.writerow(list(perf.keys()))
-        cw.writerow(list(perf.values()))
+    print(f"✅ CSV guardado: {out_csv}")
+    print(f"🩺 Health JSON: {out_health}")
 
-    print(f"\n✅ Guardado:\n - {out_csv_frame}\n - {out_csv_int}\n - {out_perf_json}\n - {out_perf_csv}")
+# ===== util pequeño (evita importar numpy solo por un percentil) =====
+def np_percentile(seq, q):
+    # q en [0,100]; implementación simple para no depender de numpy en RPi mínima
+    if not seq:
+        return 0.0
+    data = sorted(seq)
+    k = (len(data)-1) * (q/100.0)
+    f = int(math.floor(k))
+    c = int(math.ceil(k))
+    if f == c:
+        return float(data[int(k)])
+    d0 = data[f] * (c-k)
+    d1 = data[c] * (k-f)
+    return float(d0+d1)
 
-# -----------------------------
-# BATCH
-# -----------------------------
+# ========= BATCH =========
 if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     videos = discover_videos(INPUT_DIR, EXTS, RECURSIVE)
@@ -515,6 +439,7 @@ if __name__ == "__main__":
     for i, vp in enumerate(videos, 1):
         try:
             print(f"\n({i}/{len(videos)}) {vp}")
-            analyze_video(vp, OUT_DIR, agg_interval_s=AGG_INTERVAL_S)
+            process_video_csv_colab(vp, OUT_DIR)
         except Exception as e:
             print(f"⚠️ Error procesando {vp}: {e}")
+

@@ -1,0 +1,19 @@
+{
+  "video": "026_nightnoglasses_mix.mp4",
+  "frames_processed": 6780,
+  "wall_time_s": 176.424,
+  "effective_fps": 38.43,
+  "frame_ms_avg": 26.0,
+  "frame_ms_median": 26.65,
+  "frame_ms_p90": 32.7,
+  "frame_ms_max": 89.28,
+  "cpu_percent_avg": 111.0,
+  "rss_memory_mb_avg": 198.9,
+  "cpu_temp_c": 67.5,
+  "rpi_gpu_clock_hz": 960012800,
+  "rpi_gpu_mem_mb": 4,
+  "rpi_arm_mem_mb": 1020,
+  "fps_nominal_from_file": 29.97,
+  "width": 640,
+  "height": 480
+}
