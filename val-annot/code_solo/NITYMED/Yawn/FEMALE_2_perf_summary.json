@@ -1,0 +1,17 @@
+{
+  "video": "FEMALE_2.mp4",
+  "frames_processed": 1015,
+  "wall_time_s": 38.36,
+  "effective_fps": 26.46,
+  "frame_ms_avg": 37.7,
+  "frame_ms_median": 36.66,
+  "frame_ms_p90": 42.1,
+  "frame_ms_max": 78.45,
+  "cpu_percent_avg": 142.8,
+  "rss_memory_mb_avg": 246.5,
+  "cpu_temp_c": 70.8,
+  "threads_used": 2,
+  "fps_nominal_from_file": 25.0,
+  "width": 1920,
+  "height": 1080
+}

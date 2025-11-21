@@ -1,0 +1,19 @@
+{
+  "video": "030_glasses_mix.mp4",
+  "frames_processed": 14302,
+  "wall_time_s": 408.494,
+  "effective_fps": 35.01,
+  "frame_ms_avg": 28.55,
+  "frame_ms_median": 26.97,
+  "frame_ms_p90": 33.26,
+  "frame_ms_max": 104.42,
+  "cpu_percent_avg": 108.8,
+  "rss_memory_mb_avg": 175.0,
+  "cpu_temp_c": 66.4,
+  "rpi_gpu_clock_hz": 960012800,
+  "rpi_gpu_mem_mb": 4,
+  "rpi_arm_mem_mb": 1020,
+  "fps_nominal_from_file": 29.97,
+  "width": 640,
+  "height": 480
+}

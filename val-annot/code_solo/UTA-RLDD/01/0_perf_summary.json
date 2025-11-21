@@ -1,0 +1,17 @@
+{
+  "video": "0.mov",
+  "frames_processed": 18053,
+  "wall_time_s": 1104.094,
+  "effective_fps": 16.35,
+  "frame_ms_avg": 60.89,
+  "frame_ms_median": 59.17,
+  "frame_ms_p90": 64.56,
+  "frame_ms_max": 1278.97,
+  "cpu_percent_avg": 144.6,
+  "rss_memory_mb_avg": 241.3,
+  "cpu_temp_c": 73.0,
+  "threads_used": 2,
+  "fps_nominal_from_file": 29.97,
+  "width": 1080,
+  "height": 1920
+}

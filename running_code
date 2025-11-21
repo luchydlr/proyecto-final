@@ -1,0 +1,553 @@
+# ================== IMPORTS ==================
+import os
+import cv2
+import math
+import csv
+import time
+import json
+import ssl
+import queue
+import threading
+from collections import deque
+from datetime import datetime
+
+import numpy as np  # si prefieres sin numpy, reemplaza np.mean por promedio manual
+
+from picamera2 import Picamera2
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+
+from paho.mqtt import client as mqtt
+
+# ================== CONFIGURACIÓN ==================
+CAM_SIZE = (640, 480)
+
+# Ventana temporal para métricas “por ventana”
+FRAMES_INTERVAL      = 1800         # nº frames por ventana de salida (igual que tu versión)
+FATIGA_PERCLOS       = 30.0        # %
+SOMNO_MIN_PERCLOS    = 40.0        # %
+MICROSLEEP_FRAMES    = 30          # racha de frames cerrados para flag de microsueño (visual)
+
+# ---- PERCLOS ROBUSTO (nuevo) ----
+PERCLOS_WINDOW_S     = 60.0        # segundos de ventana deslizante
+MIN_CLOSE_MS         = 200         # mínima duración de cierre para contar (evita blinks muy cortos)
+
+# Umbrales geométricos
+EYE_CLOSED_THRESHOLD = 0.009       # tu medida vertical (no EAR) con FaceLandmarker (dist top-bottom)
+YAWN_MAR_THRESHOLD   = 0.65
+YAWN_HOLD_FRAMES     = 5
+
+# Salidas
+CSV_FILENAME         = "session_log.csv"            # (igual que antes) resumen por ventana
+FRAME_CSV_FILENAME   = "session_log_frames.csv"     # (nuevo) por frame con PERCLOS en vivo
+WRITE_FRAME_CSV      = True                         # pon False si no quieres el CSV por frame
+
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
+
+# ========== AWS IoT Core ==========
+ENDPOINT   = "a1omfl67425kjv-ats.iot.us-east-2.amazonaws.com"
+PORT       = 8883
+CLIENT_ID  = "rsp5"
+TOPIC      = "alertas"
+
+CA_PATH   = "aws/AmazonRootCA1.pem"
+CERT_PATH = "aws/certificate.pem.crt"
+KEY_PATH  = "aws/private.pem.key"
+
+# OJO: verifica el nombre de tu modelo (tu ejemplo tenía .taskq)
+MODEL_PATH = "facemesh/face_landmarker.task"
+
+frame_queue = queue.Queue(maxsize=1)
+annot_queue = queue.Queue(maxsize=1)
+stop_event  = threading.Event()
+
+# ========== UMBRALES TABLA (frecuencias por minuto) ==========
+BLINK_MICRO_MAX   = 6.0
+BLINK_SOMNO_MAX   = 12.0
+BLINK_FATIGA_MAX  = 20.0
+BLINK_NORM_MIN    = 17.0
+BLINK_NORM_MAX    = 25.0
+
+YAWN_FATIGA_MIN   = 1.0
+YAWN_FATIGA_MAX   = 4.0
+YAWN_SOMNO_MIN    = 4.0  # >4 -> somnolencia
+
+# ================== AUXILIARES DE MÉTRICAS ==================
+def euclidean(a, b):
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+def eye_aspect_ratio_like(landmarks, right=True):
+    """
+    Tu métrica: distancia vertical entre dos puntos del párpado (NO EAR normalizado).
+    right=True usa (145,159); right=False usa (374,386).
+    """
+    if right:
+        top, bottom = landmarks[145], landmarks[159]
+    else:
+        top, bottom = landmarks[374], landmarks[386]
+    return euclidean(top, bottom)
+
+def mouth_aspect_ratio(landmarks):
+    vertical_pairs = [(13, 14), (82, 87), (312, 317)]
+    horizontals = (78, 308)
+    v_dist = np.mean([euclidean(landmarks[a], landmarks[b]) for a, b in vertical_pairs])
+    h_dist = euclidean(landmarks[horizontals[0]], landmarks[horizontals[1]])
+    return (v_dist / h_dist) if h_dist > 0 else 0.0
+
+def put_text_rgb(rgb_frame, text, pos=(12, 28), color=(0, 255, 255)):
+    cv2.putText(rgb_frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+
+def draw_landmarks_on_frame_rgb(rgb_frame, marks):
+    h, w = rgb_frame.shape[:2]
+    for lm in marks[0]:
+        x = int(lm.x * w); y = int(lm.y * h)
+        cv2.circle(rgb_frame, (x, y), 1, (0, 255, 0), -1)
+
+# ================== MediaPipe: detector ==================
+def initialize_detector():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Modelo no encontrado: {MODEL_PATH}.")
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+# ================== Hilo de Captura ==================
+class CaptureWorker(threading.Thread):
+    def __init__(self, stop_evt):
+        super().__init__(daemon=True)
+        self.stop_evt = stop_evt
+        self.picam2 = None
+
+    def run(self):
+        try:
+            self.picam2 = Picamera2()
+            cfg = self.picam2.create_preview_configuration(main={"format":"RGB888","size":CAM_SIZE})
+            self.picam2.configure(cfg)
+            self.picam2.start()
+            time.sleep(0.2)
+            print("🟢 Cámara lista (Picamera2).")
+        except Exception as e:
+            import traceback
+            print(f"❌ Error iniciando cámara: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+            return
+
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    rgb = self.picam2.capture_array()
+                except Exception:
+                    time.sleep(0.005)
+                    continue
+
+                if frame_queue.full():
+                    try: frame_queue.get_nowait()
+                    except queue.Empty: pass
+                frame_queue.put(rgb)
+        except Exception as e:
+            import traceback
+            print(f"❌ Excepción en CaptureWorker: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+        finally:
+            try: self.picam2.stop()
+            except Exception: pass
+
+# ================== Hilo de Inferencia (CSV + MQTT) ==================
+class InferenceWorker(threading.Thread):
+    def __init__(self, stop_evt):
+        super().__init__(daemon=True)
+        self.stop_evt = stop_evt
+
+        # Detector
+        self.detector = initialize_detector()
+
+        # --------- Estado por ventana (igual que tu versión) ----------
+        self.frames_cnt = 0
+        self.closed_frames = 0
+        self.closed_streak = 0
+        self.microsleep_flag = False
+
+        self.blink_count_win = 0
+        self.yawn_count_win  = 0
+
+        self.eyes_closed_prev = False
+        self.yawn_frames = 0
+        self.window_start_ts = time.time()
+
+        # --------- PERCLOS deslizante (NUEVO) ----------
+        self.perclos_win = deque()         # guarda SOLO frames válidos (0/1 tras filtro)
+        self.perclos_win_times = deque()   # timestamps (s) de cada muestra válida
+        self.min_close_fr = None           # se calcula con FPS una vez
+        self.run_closed = 0                # racha cruda de frames cerrados para filtro de duración
+
+        # CSV ventana (igual que antes, pero ya incluías PERCLOS)
+        self.csv_file = open(CSV_FILENAME, mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['Timestamp','Estado','PERCLOS (%)','BlinkRate (/min)','YawnRate (/min)','Blinks','Yawns'])
+
+        # CSV por frame (opcional)
+        self.frame_csv_file = open(FRAME_CSV_FILENAME, mode='w', newline='') if WRITE_FRAME_CSV else None
+        if self.frame_csv_file:
+            self.frame_csv_writer = csv.writer(self.frame_csv_file)
+            self.frame_csv_writer.writerow([
+                'ts_s','valid','eyes_closed_raw','perclos_frac','perclos_pct',
+                'blink_count_acc','yawn_count_acc'
+            ])
+
+        # MQTT
+        self.mqtt_client = mqtt.Client(client_id=CLIENT_ID)
+        self.mqtt_client.tls_set(
+            ca_certs=CA_PATH,
+            certfile=CERT_PATH,
+            keyfile=KEY_PATH,
+            tls_version=ssl.PROTOCOL_TLSv1_2
+        )
+        self.mqtt_client.on_connect = self._on_connect
+        try:
+            self.mqtt_client.connect(ENDPOINT, PORT, keepalive=60)
+            self.mqtt_client.loop_start()
+            print("🔗 MQTT (AWS IoT) inicializado.")
+          # ---- Envío de estado inicial ----
+            print("Enviando estado inicial MQTT: INICIANDO…")
+            payload_init = {
+               "device_id": CLIENT_ID,
+               "estado": "INICIANDO"
+        }
+            self._publish(payload_init, qos=1)
+
+        except Exception as e:
+            import traceback
+            print(f"⚠️ No se pudo conectar a MQTT: {e}")
+            traceback.print_exc()
+
+        # FPS (para convertir ms→frames)
+        self.fps_est = 30.0   # default
+        self._fps_init_time = time.time()
+        self._fps_init_frames = 0
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            print("✅ Conectado a AWS IoT Core")
+        else:
+            print(f"❌ Error de conexión MQTT, código: {rc}")
+
+    def _publish(self, payload, qos=1):
+        if not self.mqtt_client:
+            return
+        try:
+            self.mqtt_client.publish(TOPIC, json.dumps(payload), qos=qos)
+        except Exception:
+            try:
+                self.mqtt_client.reconnect()
+            except Exception:
+                pass
+
+    # ---------- Procesamiento por frame ----------
+    def _process_metrics(self, marks):
+        lms = marks[0]
+        # ojo “cerrado” por tu métrica:
+        ear_r_like = eye_aspect_ratio_like(lms, right=True)
+        ear_l_like = eye_aspect_ratio_like(lms, right=False)
+        eyes_closed = (ear_r_like < EYE_CLOSED_THRESHOLD and ear_l_like < EYE_CLOSED_THRESHOLD)
+
+        # Frames cerrados + racha para microsueño (igual que antes)
+        if eyes_closed:
+            self.closed_frames += 1
+            self.closed_streak += 1
+        else:
+            self.closed_streak = 0
+
+        # Parpadeo (flanco)
+        if not self.eyes_closed_prev and eyes_closed:
+            self.eyes_closed_prev = True
+        elif self.eyes_closed_prev and not eyes_closed:
+            self.blink_count_win += 1
+            self.eyes_closed_prev = False
+
+        # Bostezo (MAR)
+        mar = mouth_aspect_ratio(lms)
+        if mar > YAWN_MAR_THRESHOLD:
+            self.yawn_frames += 1
+        else:
+            if self.yawn_frames > YAWN_HOLD_FRAMES:
+                self.yawn_count_win += 1
+            self.yawn_frames = 0
+
+        return eyes_closed, mar
+
+    # ---------- PERCLOS (reglas tabla) ----------
+    def _estado_por_perclos(self, perclos):
+        if perclos >= SOMNO_MIN_PERCLOS:
+            return "SOMNOLENCIA"
+        if perclos >= FATIGA_PERCLOS:
+            return "FATIGA"
+        return "NORMAL"
+
+    # ---------- Fusión de criterios ----------
+    def _estado_por_blink_rate(self, rate):
+        if rate < BLINK_MICRO_MAX:      return "MICROSUEÑO"
+        if rate < BLINK_SOMNO_MAX:      return "SOMNOLENCIA"
+        if rate <= BLINK_FATIGA_MAX:    return "FATIGA"
+        if BLINK_NORM_MIN <= rate <= BLINK_NORM_MAX: return "NORMAL"
+        return "NORMAL"
+
+    def _estado_por_yawn_rate(self, rate):
+        if rate > YAWN_SOMNO_MIN:                       return "SOMNOLENCIA"
+        if YAWN_FATIGA_MIN <= rate <= YAWN_FATIGA_MAX:  return "FATIGA"
+        return "NORMAL"
+
+    def _fusion_decision(self, perclos_pct, blink_rate, yawn_rate):
+        if self.microsleep_flag:
+            return "MICROSUEÑO"
+        candidatos = [
+            #self._estado_por_blink_rate(blink_rate),
+            self._estado_por_yawn_rate(yawn_rate),
+            self._estado_por_perclos(perclos_pct)
+        ]
+        rank = {"NORMAL":0, "FATIGA":1, "SOMNOLENCIA":2, "MICROSUEÑO":3}
+        return max(candidatos, key=lambda x: rank[x])
+
+    # ---------- Ventana por FRAMES_INTERVAL (igual que antes) ----------
+    def _ventana_cerrar(self):
+        print("Cerrando ventana…")
+        now = time.time()
+        elapsed = max(now - self.window_start_ts, 1e-3)  # s reales de la ventana
+
+        # Tu PERCLOS original por N frames (lo dejo tal cual):
+        perclos_pct = 100.0 * self.closed_frames / float(max(1, FRAMES_INTERVAL))
+        blink_rate  = (self.blink_count_win * 60.0) / elapsed
+        yawn_rate   = (self.yawn_count_win  * 60.0) / elapsed
+
+        estado_final = self._fusion_decision(perclos_pct, blink_rate, yawn_rate)
+
+        # CSV ventana
+        self.csv_writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            estado_final, round(perclos_pct, 2),
+            round(blink_rate, 2), round(yawn_rate, 2),
+            int(self.blink_count_win), int(self.yawn_count_win)
+        ])
+
+        # MQTT (solo si alerta)
+        print(f"Ventana: Estado={estado_final}, PERCLOS={perclos_pct:.2f}%, BlinkRate={blink_rate:.2f}/min, YawnRate={yawn_rate:.2f}/min")  
+         #if estado_final != "NORMAL":
+        print("Enviando alerta MQTT…")
+        payload = {
+            "device_id": CLIENT_ID,
+            "estado": estado_final,
+            "perclos": round(perclos_pct, 2),
+            "blink_rate": round(blink_rate, 2),
+            "yawn_rate": round(yawn_rate, 2),
+            "blinks": int(self.blink_count_win),
+            "yawns": int(self.yawn_count_win),
+            "ts": int(now)
+        }
+        self._publish(payload, qos=1)
+
+        # Reset ventana
+        self.frames_cnt = 0
+        self.closed_frames = 0
+        self.closed_streak = 0
+        self.microsleep_flag = False
+        self.blink_count_win = 0
+        self.yawn_count_win  = 0
+        self.window_start_ts = now
+
+    # ---------- PERCLOS deslizante con backfill (NUEVO) ----------
+    def _update_perclos_sliding(self, valid, eyes_closed_raw, t_s):
+        """
+        valid: bool (hay landmarks)
+        eyes_closed_raw: 0/1 por umbral
+        t_s: timestamp en segundos (monótono)
+        """
+        # inicializa fps y parámetros dependientes
+        if self.min_close_fr is None:
+            # estimar FPS “soft” a partir de los primeros frames
+            self._fps_init_frames += 1
+            dt = max(time.time() - self._fps_init_time, 1e-3)
+            self.fps_est = max(5.0, min(60.0, self._fps_init_frames / dt))
+            self.min_close_fr = max(1, int(round((MIN_CLOSE_MS/1000.0) * self.fps_est)))
+
+        # limpiar ventana por tiempo (PERCLOS_WINDOW_S)
+        while self.perclos_win_times and (t_s - self.perclos_win_times[0] > PERCLOS_WINDOW_S):
+            self.perclos_win_times.popleft()
+            self.perclos_win.popleft()
+
+        if not valid:
+            # no agregar nada a la ventana (no contamina)
+            return
+
+        # actualizar racha cruda
+        if eyes_closed_raw:
+            self.run_closed += 1
+            # placeholder 0 (lo cambiamos a 1 si alcanza la duración mínima)
+            self.perclos_win.append(0)
+            self.perclos_win_times.append(t_s)
+
+            if self.run_closed >= self.min_close_fr:
+                # este frame cuenta
+                self.perclos_win[-1] = 1
+                # si ACABA de cruzar el umbral, backfill hacia atrás los previos de la racha
+                if self.run_closed == self.min_close_fr:
+                    n_back = min(self.min_close_fr - 1, len(self.perclos_win) - 1)
+                    for i in range(1, n_back + 1):
+                        self.perclos_win[-1 - i] = 1
+        else:
+            self.run_closed = 0
+            # ojo abierto → agrega 0 válido
+            self.perclos_win.append(0)
+            self.perclos_win_times.append(t_s)
+
+    def _perclos_current(self):
+        """Devuelve (frac, pct) sobre la ventana temporal (solo válidos)."""
+        denom = len(self.perclos_win)
+        if denom == 0:
+            return 0.0, 0.0
+        frac = sum(self.perclos_win) / float(denom)
+        return frac, (frac * 100.0)
+
+    def run(self):
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    rgb = frame_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                state_overlay = "NORMAL"
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = self.detector.detect(mp_image)
+
+                t_now = time.time()  # timestamp en segundos
+                valid = False
+                eyes_closed_raw = 0
+
+                if result.face_landmarks:
+                    # dibuja (opcional)
+                    draw_landmarks_on_frame_rgb(rgb, result.face_landmarks)
+
+                    # métricas base (mantengo tu lógica)
+                    eyes_closed, mar = self._process_metrics(result.face_landmarks)
+                    valid = True
+                    eyes_closed_raw = 1 if eyes_closed else 0
+
+                    # overlay de estado rápido
+                    if eyes_closed:
+                        state_overlay = "OJOS CERRADOS"
+                    elif mar > YAWN_MAR_THRESHOLD:
+                        state_overlay = "BOSTEZO"
+                    else:
+                        state_overlay = "NORMAL"
+
+                    # ventana de FRAMES_INTERVAL (igual que antes)
+                    self.frames_cnt += 1
+
+                    # microsueño como flag de ventana
+                    if self.closed_streak >= MICROSLEEP_FRAMES:
+                        self.microsleep_flag = True
+                        state_overlay = "MICROSUEÑO"
+                        now = time.time()
+                        print("Enviando alerta MQTT POR MICROSUEÑO…")
+                        payload = {
+                            "device_id": CLIENT_ID,
+                            "estado": state_overlay,
+                            "perclos": round(perclos_pct, 2),
+                            "blink_rate": 0,
+                            "yawn_rate": 0,
+                            "blinks": int(self.blink_count_win),
+                            "yawns": int(self.yawn_count_win),
+                            "ts": int(now)
+                        }
+                        self._publish(payload, qos=1)
+
+
+                    if self.frames_cnt >= FRAMES_INTERVAL:
+                        self._ventana_cerrar()
+                else:
+                    put_text_rgb(rgb, "Sin rostro", (12, 56), (0, 255, 255))
+
+                # ---- PERCLOS deslizante (nuevo) ----
+                self._update_perclos_sliding(valid, eyes_closed_raw, t_now)
+                perclos_frac, perclos_pct = self._perclos_current()
+
+                # CSV por frame (opcional)
+                if self.frame_csv_file:
+                    self.frame_csv_writer.writerow([
+                        f"{t_now:.3f}", int(valid), eyes_closed_raw,
+                        f"{perclos_frac:.5f}", f"{perclos_pct:.2f}",
+                        int(self.blink_count_win), int(self.yawn_count_win)
+                    ])
+
+                # preview
+                put_text_rgb(rgb, state_overlay, (12, 28))
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                if annot_queue.full():
+                    try: annot_queue.get_nowait()
+                    except queue.Empty: pass
+                annot_queue.put(bgr)
+
+                frame_queue.task_done()
+        except Exception as e:
+            import traceback
+            print(f"❌ Excepción en InferenceWorker: {e}")
+            traceback.print_exc()
+            self.stop_evt.set()
+        finally:
+            try:
+                self.csv_file.flush()
+                self.csv_file.close()
+            except Exception:
+                pass
+            try:
+                if self.frame_csv_file:
+                    self.frame_csv_file.flush()
+                    self.frame_csv_file.close()
+            except Exception:
+                pass
+            try:
+                if self.mqtt_client:
+                    print("🔌 Desconectando MQTT…")
+                    self.mqtt_client.loop_stop()
+                    self.mqtt_client.disconnect()
+            except Exception:
+                pass
+
+# ================== MAIN / UI ==================
+def main():
+    print("Iniciando hilos (captura / inferencia)…")
+    cap_t = CaptureWorker(stop_event)
+    inf_t = InferenceWorker(stop_event)
+
+    cap_t.start()
+    inf_t.start()
+
+    print(f"🟢 Presiona 'q' para salir. HEADLESS={HEADLESS}")
+    try:
+        while not stop_event.is_set():
+            try:
+                frame = annot_queue.get(timeout=0.3)
+                if not HEADLESS:
+                    cv2.imshow("Fatigue Monitor - OV5647 (PERCLOS)", frame)
+                    if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                        stop_event.set()
+            except queue.Empty:
+                pass
+    finally:
+        stop_event.set()
+        cap_t.join(timeout=2.0)
+        inf_t.join(timeout=2.0)
+        if not HEADLESS:
+            cv2.destroyAllWindows()
+        print("Finalizado.")
+
+if __name__ == "__main__":
+    main()

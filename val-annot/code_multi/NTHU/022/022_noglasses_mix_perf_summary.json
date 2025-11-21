@@ -1,0 +1,17 @@
+{
+  "video": "022_noglasses_mix.mp4",
+  "frames_processed": 16849,
+  "wall_time_s": 456.485,
+  "effective_fps": 36.91,
+  "frame_ms_avg": 0.07,
+  "frame_ms_median": 0.06,
+  "frame_ms_p90": 0.09,
+  "frame_ms_max": 2.52,
+  "cpu_percent_avg": 115.8,
+  "rss_memory_mb_avg": 209.9,
+  "cpu_temp_c": 73.0,
+  "threads_used": 1,
+  "fps_nominal_from_file": 29.97,
+  "width": 640,
+  "height": 480
+}

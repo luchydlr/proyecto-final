@@ -1,0 +1,17 @@
+{
+  "video": "FEMALE_8.mp4",
+  "frames_processed": 577,
+  "wall_time_s": 22.33,
+  "effective_fps": 25.84,
+  "frame_ms_avg": 38.61,
+  "frame_ms_median": 37.09,
+  "frame_ms_p90": 42.28,
+  "frame_ms_max": 79.52,
+  "cpu_percent_avg": 142.0,
+  "rss_memory_mb_avg": 291.5,
+  "cpu_temp_c": 70.3,
+  "threads_used": 2,
+  "fps_nominal_from_file": 25.0,
+  "width": 1920,
+  "height": 1080
+}

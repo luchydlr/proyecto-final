@@ -1,0 +1,17 @@
+{
+  "video": "MALE_7.mp4",
+  "frames_processed": 530,
+  "wall_time_s": 20.368,
+  "effective_fps": 26.02,
+  "frame_ms_avg": 38.34,
+  "frame_ms_median": 36.79,
+  "frame_ms_p90": 42.03,
+  "frame_ms_max": 71.26,
+  "cpu_percent_avg": 139.4,
+  "rss_memory_mb_avg": 305.3,
+  "cpu_temp_c": 71.9,
+  "threads_used": 2,
+  "fps_nominal_from_file": 25.0,
+  "width": 1920,
+  "height": 1080
+}

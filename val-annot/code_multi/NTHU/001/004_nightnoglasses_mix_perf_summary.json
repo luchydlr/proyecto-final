@@ -1,0 +1,17 @@
+{
+  "video": "004_nightnoglasses_mix.mp4",
+  "frames_processed": 11728,
+  "wall_time_s": 313.11,
+  "effective_fps": 37.46,
+  "frame_ms_avg": 0.06,
+  "frame_ms_median": 0.05,
+  "frame_ms_p90": 0.08,
+  "frame_ms_max": 1.97,
+  "cpu_percent_avg": 115.3,
+  "rss_memory_mb_avg": 210.5,
+  "cpu_temp_c": 68.6,
+  "threads_used": 1,
+  "fps_nominal_from_file": 29.97,
+  "width": 640,
+  "height": 480
+}
